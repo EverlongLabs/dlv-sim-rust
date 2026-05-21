@@ -1,0 +1,18 @@
+services:
+  dlv-sim:
+    build: .
+    volumes:
+      - ../dlv-sim/data:/app/data:ro
+      - ./output:/app/output
+    environment:
+      - RUST_BACKTRACE=0
+      - BF_POOL=${BF_POOL:-CBBTC_USDC_BASE}
+      - BF_START_DATE=${BF_START_DATE:-2025-09-09}
+      - BF_END_DATE=${BF_END_DATE:-2026-03-06}
+      - LOOKUP_PERIOD=${LOOKUP_PERIOD:-5}
+      - ARB_STRATEGY=${ARB_STRATEGY:-true}
+      - TARGET_CR_PCT=${TARGET_CR_PCT:-200}
+      - IS_REGULATE_DEBT=${IS_REGULATE_DEBT:-true}
+      - ALM_ONLY=${ALM_ONLY:-false}
+      - ARB_MODE=${ARB_MODE:-close_gap}
+      - ACTIVE_REBALANCE_RATIO_DEVIATION_BPS=${ACTIVE_REBALANCE_RATIO_DEVIATION_BPS:-100}
