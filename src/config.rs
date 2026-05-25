@@ -146,7 +146,7 @@ fn parse_charm_env() -> VaultParams {
                 wide_threshold: v["wideThreshold"].as_i64().unwrap_or(18000) as i32,
                 base_threshold: v["baseThreshold"].as_i64().unwrap_or(1020) as i32,
                 limit_threshold: v["limitThreshold"].as_i64().unwrap_or(300) as i32,
-                period: v["period"].as_u64().unwrap_or(43200),
+                period: v["period"].as_u64().unwrap_or(43200 * 200000),
             };
         }
     }
@@ -155,7 +155,7 @@ fn parse_charm_env() -> VaultParams {
         wide_threshold: 18000,
         base_threshold: 1020,
         limit_threshold: 300,
-        period: 43200,
+        period: 43200 * 200000,
     }
 }
 

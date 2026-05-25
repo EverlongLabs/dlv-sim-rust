@@ -390,7 +390,7 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             dispatch_dlv(cfg, &mut vault, &mut pool, target_cr_wad, w_const, curr_ms, &mut dlv_calls);
 
             // ALM
-            dispatch_alm(cfg, &mut vault, &mut pool, ext_sqrt, curr_ms, &mut alm_calls);
+            dispatch_alm(cfg, &mut vault, &mut pool, ext_sqrt, curr_ms, &mut alm_calls, tick_count);
 
             // Regulate debt (runs LAST in arb mode)
             dispatch_regulate_debt(cfg, &mut vault, &mut pool, target_cr_wad, &mut regulate_debt_calls);
@@ -405,7 +405,7 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             dispatch_dlv(cfg, &mut vault, &mut pool, target_cr_wad, w_const, curr_ms, &mut dlv_calls);
 
             // ALM
-            dispatch_alm(cfg, &mut vault, &mut pool, ext_sqrt, curr_ms, &mut alm_calls);
+            dispatch_alm(cfg, &mut vault, &mut pool, ext_sqrt, curr_ms, &mut alm_calls, tick_count);
 
             // Per-tick diagnostic (env TICK_DIAG=N to print first N ticks)
             if let Some(diag_limit) = std::env::var("TICK_DIAG").ok().and_then(|v| v.parse::<u64>().ok()) {
@@ -732,10 +732,10 @@ fn dispatch_alm(
     ext_sqrt: U256,
     curr_ms: i64,
     alm_calls: &mut u64,
+    tick_count: u64,
 ) {
-    let time_since_last = curr_ms - vault.last_rebalance_ms;
-    let time_trigger = vault.last_rebalance_ms == 0
-        || time_since_last >= (vault.params.period as i64 * 1000);
+    let charm_rebalance_period = vault.params.period as u64 / cfg.lookup_period as u64;
+    let time_trigger = charm_rebalance_period > 0 && tick_count % charm_rebalance_period == 0;
     let (ratio_trigger, dev_bps_val) = if cfg.active_rebalance_ratio_deviation_bps > 0 {
         let dev_bps = vault.share_deviation_bps(pool, None);
         (dev_bps >= cfg.active_rebalance_ratio_deviation_bps as u64, dev_bps)

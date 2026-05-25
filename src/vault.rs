@@ -1181,7 +1181,8 @@ impl Vault {
         if total_value.is_zero() { return 0; }
         let bps_scale = U256::from_u128(10_000);
         let half_bps = U256::from_u128(5_000);
-        let stable_share_bps = full_math::mul_div(stable_amt, bps_scale, total_value);
+        let half = total_value >> 1;
+        let stable_share_bps = (stable_amt * bps_scale + half) / total_value;
         if stable_share_bps > half_bps {
             (stable_share_bps - half_bps).lo as u64
         } else {
