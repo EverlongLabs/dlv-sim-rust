@@ -322,16 +322,18 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
     let mut arb_calls: u64 = 0;
     let w_const = U256::from_u128(1_000_000_000_000_000_000);
 
-    // APY tracking (uses volatile_price_wad, matching TS calculateAPY)
+    // APY + risk metrics tracking (pool price, matching TS with no quoter/oracle)
     let mut first_apy_value: Option<(f64, f64)> = None;
     let mut last_apy_value: Option<(f64, f64)> = None;
-
-    // Risk metrics tracking (uses external price, matching TS computeRiskMetrics)
     let mut btc_values_for_risk: Vec<f64> = Vec::new();
     let mut min_cr: f64 = f64::INFINITY;
     let mut peak_btc_value: f64 = 0.0;
     let mut max_drawdown_pct: f64 = 0.0;
     let mut monthly_btc_values: HashMap<String, (f64, f64)> = HashMap::new();
+
+    // Idle snapshot interval: TS logs every 60 min when no event fires
+    let idle_snapshot_interval_ms: i64 = 3600 * 1000;
+    let mut last_idle_snapshot_ms: i64 = 0;
 
     // Event cursor for event-replay mode
     let mut event_cursor: usize = 0;
@@ -355,6 +357,10 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
 
         let mut arb_profit = U256::ZERO;
         let mut arb_dev_bps = 0.0f64;
+
+        let prev_alm = alm_calls;
+        let prev_dlv = dlv_calls;
+        let mut rd_fired = false;
 
         if cfg.is_arb_strategy {
             // ── ARB-ONLY MODE ──
@@ -393,30 +399,16 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             dispatch_alm(cfg, &mut vault, &mut pool, ext_sqrt, curr_ms, &mut alm_calls, tick_count);
 
             // Regulate debt (runs LAST in arb mode)
-            dispatch_regulate_debt(cfg, &mut vault, &mut pool, target_cr_wad, &mut regulate_debt_calls);
+            rd_fired = dispatch_regulate_debt(cfg, &mut vault, &mut pool, target_cr_wad, &mut regulate_debt_calls);
         } else {
             // ── EVENT-REPLAY MODE ──
             // Dispatch order: REGULATE_DEBT → DLV → ALM → (replay events)
 
             // Regulate debt (runs FIRST in event-replay mode)
-            if tick_count >= 551063 && tick_count <= 551071 {
-                eprintln!("[TICK-DBG] tick={} BEFORE-RD idle0={} idle1={} baseLiq={} limitLiq={}",
-                    tick_count, vault.idle0.to_dec_string(), vault.idle1.to_dec_string(),
-                    vault.base.as_ref().map(|p| p.liquidity).unwrap_or(U256::ZERO).to_dec_string(),
-                    vault.limit.as_ref().map(|p| p.liquidity).unwrap_or(U256::ZERO).to_dec_string());
-            }
-            dispatch_regulate_debt(cfg, &mut vault, &mut pool, target_cr_wad, &mut regulate_debt_calls);
-            if tick_count >= 551063 && tick_count <= 551071 {
-                eprintln!("[TICK-DBG] tick={} AFTER-RD idle0={} idle1={}",
-                    tick_count, vault.idle0.to_dec_string(), vault.idle1.to_dec_string());
-            }
+            rd_fired = dispatch_regulate_debt(cfg, &mut vault, &mut pool, target_cr_wad, &mut regulate_debt_calls);
 
             // DLV
             dispatch_dlv(cfg, &mut vault, &mut pool, target_cr_wad, w_const, curr_ms, &mut dlv_calls);
-            if tick_count >= 551063 && tick_count <= 551071 {
-                eprintln!("[TICK-DBG] tick={} AFTER-DLV idle0={} idle1={} dlvCalls={}",
-                    tick_count, vault.idle0.to_dec_string(), vault.idle1.to_dec_string(), dlv_calls);
-            }
 
             // ALM
             dispatch_alm(cfg, &mut vault, &mut pool, ext_sqrt, curr_ms, &mut alm_calls, tick_count);
@@ -445,32 +437,41 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             }
         }
 
-        // Snapshot values
-        let nav = vault.total_pool_value(&pool, Some(ext_sqrt));
-        let value_stable = vault.total_value_in_stable(&pool, Some(ext_sqrt));
+        // Detect which events fired this tick
+        let alm_fired = alm_calls > prev_alm;
+        let dlv_fired = dlv_calls > prev_dlv;
+        let event_fired = alm_fired || dlv_fired || rd_fired;
+
+        // TS only registers log entries at: ALM/DLV/non-noop-RD events, or idle snapshots every 60 min.
+        // Metrics (APY, risk, minCR, drawdown, monthly) are computed from these sparse entries.
+        let should_register = event_fired || (curr_ms - last_idle_snapshot_ms >= idle_snapshot_interval_ms);
+        if should_register && !event_fired {
+            last_idle_snapshot_ms = curr_ms;
+        }
+
+        // Snapshot values — use pool price (None) for output metrics,
+        // matching TS which uses pool.sqrtPriceX96 when no quoter/oracle is active.
+        let pool_sqrt = pool.sqrt_price_x96();
+        let nav = vault.total_pool_value(&pool, None);
+        let value_stable = vault.total_value_in_stable(&pool, None);
         let vol_price_wad =
-            Vault::volatile_price_wad(ext_sqrt, cfg.pool_config.is_volatile_token0());
-        let cr_pct = vault.collateral_ratio_pct(&pool, Some(ext_sqrt));
-        let snap_price_wad = Vault::pool_price(pool.sqrt_price_x96());
-        let cr_wad = vault.collateral_ratio_wad(&pool, Some(ext_sqrt));
-        let lp_ratio = vault.lp_ratio(&pool, Some(ext_sqrt));
+            Vault::volatile_price_wad(pool_sqrt, cfg.pool_config.is_volatile_token0());
+        let cr_pct = vault.collateral_ratio_pct(&pool, None);
+        let snap_price_wad = Vault::pool_price(pool_sqrt);
+        let cr_wad = vault.collateral_ratio_wad(&pool, None);
+        let lp_ratio = vault.lp_ratio(&pool, None);
 
         let vault_value_f =
             nav.lo as f64 / 10f64.powi(cfg.pool_config.stable_decimals() as i32);
         let price_f = vol_price_wad.lo as f64 / 1e18;
 
-        // APY tracking (pool-derived price, matching TS calculateAPY)
-        if price_f > 0.0 {
+        // Only register metrics at the same times as TS (sparse sampling)
+        if should_register && price_f > 0.0 {
             let btc_value = vault_value_f / price_f;
             if first_apy_value.is_none() {
                 first_apy_value = Some((btc_value, curr_ms as f64));
             }
             last_apy_value = Some((btc_value, curr_ms as f64));
-        }
-
-        // Risk metrics tracking (external price, matching TS registerLogSummary)
-        if ext_price > 0.0 {
-            let btc_value = vault_value_f / ext_price;
 
             if btc_value > 0.0 && btc_value.is_finite() {
                 btc_values_for_risk.push(btc_value);
@@ -492,10 +493,10 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
                     .and_modify(|e| e.1 = btc_value)
                     .or_insert((btc_value, btc_value));
             }
-        }
 
-        if cr_pct.is_finite() && cr_pct > 0.0 && cr_pct < min_cr {
-            min_cr = cr_pct;
+            if cr_pct.is_finite() && cr_pct > 0.0 && cr_pct < min_cr {
+                min_cr = cr_pct;
+            }
         }
 
         let date_str = event_reader::fmt_utc_date(curr_ms);
@@ -680,7 +681,7 @@ fn dispatch_regulate_debt(
     pool: &mut CorePool,
     target_cr_wad: U256,
     regulate_debt_calls: &mut u64,
-) {
+) -> bool {
     if cfg.is_regulate_debt && !vault.virtual_debt.is_zero() {
         vault.collect_fees(pool);
         let rd_mode = vault.regulate_debt(pool, None, target_cr_wad);
@@ -688,6 +689,9 @@ fn dispatch_regulate_debt(
             vault.deploy_idle_to_lp(pool);
         }
         *regulate_debt_calls += 1;
+        rd_mode != "noop"
+    } else {
+        false
     }
 }
 
