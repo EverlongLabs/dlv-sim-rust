@@ -8,6 +8,7 @@ use crate::config::VaultParams;
 use crate::pool_config::PoolConfig;
 
 const MANAGER: &str = "0xVAULT_MANAGER";
+static RBD_DIAG_GLOBAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[derive(Debug)]
 struct RebalanceResult {
@@ -52,8 +53,8 @@ fn liquidity_for_amount0(sqrt_a: U256, sqrt_b: U256, amount: U256) -> U256 {
     let (sa, sb) = if sqrt_a > sqrt_b { (sqrt_b, sqrt_a) } else { (sqrt_a, sqrt_b) };
     let diff = sb - sa;
     if diff.is_zero() { return U256::ZERO; }
-    let num = full_math::mul_div(amount, sa, U256::ONE);
-    full_math::mul_div(num, sb, diff * Q96)
+    let intermediate = full_math::mul_div(sa, sb, Q96);
+    full_math::mul_div(amount, intermediate, diff)
 }
 
 fn liquidity_for_amount1(sqrt_a: U256, sqrt_b: U256, amount: U256) -> U256 {
@@ -283,14 +284,14 @@ impl Vault {
             .collect();
 
         let mut added_liq = [U256::ZERO; 3];
+        let mut rem0 = amount0;
+        let mut rem1 = amount1;
 
         for &(tick_lower, tick_upper, pos_liq, idx) in &pos_info {
-            // liqToMint = mulDiv(pos.liquidity, shares, totalSupply)
             let liq_to_mint = full_math::mul_div(pos_liq, shares, ts);
 
-            // Cap to what's mintable from remaining idle
             let liq_from_amts = max_liquidity_for_amounts(
-                sqrt_price, tick_lower, tick_upper, self.idle0, self.idle1,
+                sqrt_price, tick_lower, tick_upper, rem0, rem1,
             );
             let liq = liq_to_mint.min(liq_from_amts);
             if liq.is_zero() { continue; }
@@ -298,6 +299,9 @@ impl Vault {
             let (a0, a1) = pool.mint(MANAGER, tick_lower, tick_upper, I256(liq));
             let used0 = a0.abs();
             let used1 = a1.abs();
+
+            rem0 = if rem0 > used0 { rem0 - used0 } else { U256::ZERO };
+            rem1 = if rem1 > used1 { rem1 - used1 } else { U256::ZERO };
             self.idle0 = if self.idle0 > used0 { self.idle0 - used0 } else { U256::ZERO };
             self.idle1 = if self.idle1 > used1 { self.idle1 - used1 } else { U256::ZERO };
             added_liq[idx] = liq;
@@ -596,6 +600,8 @@ impl Vault {
         let result = self.rebalance_borrowed_amount(pool, None, target_cr_wad, swap_fee);
         if result.mode == 0 || result.amount.is_zero() { return; }
 
+        let rbd_log_idx = RBD_DIAG_GLOBAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         if result.mode == 1 {
             // Leverage: match TS rebalanceDebt pro-rata deposit logic
             let sqrt = pool.sqrt_price_x96();
@@ -628,6 +634,14 @@ impl Vault {
                 (deposit_stable, deposit_volatile)
             };
 
+            if rbd_log_idx >= 19 && rbd_log_idx <= 21 {
+                eprintln!("[RBD-LEV] #{} mode=lev borrow={} swapFee={} netNew={} depVol={} depStable={} a0d={} a1d={} idle0={} idle1={}",
+                    rbd_log_idx, result.amount.to_dec_string(), result.swap_fee.to_dec_string(),
+                    net_new_stable.to_dec_string(), deposit_volatile.to_dec_string(), deposit_stable.to_dec_string(),
+                    amount0_desired.to_dec_string(), amount1_desired.to_dec_string(),
+                    self.idle0.to_dec_string(), self.idle1.to_dec_string());
+            }
+
             self.virtual_debt = self.virtual_debt + result.amount;
 
             let (actual0, actual1) = self.deposit_pro_rata(pool, amount0_desired, amount1_desired);
@@ -636,6 +650,13 @@ impl Vault {
             let excess1 = if amount1_desired > actual1 { amount1_desired - actual1 } else { U256::ZERO };
             if !excess0.is_zero() { self.idle0 = self.idle0 + excess0; }
             if !excess1.is_zero() { self.idle1 = self.idle1 + excess1; }
+
+            if rbd_log_idx >= 19 && rbd_log_idx <= 21 {
+                eprintln!("[RBD-LEV] #{} AFTER actual0={} actual1={} excess0={} excess1={} idle0={} idle1={}",
+                    rbd_log_idx, actual0.to_dec_string(), actual1.to_dec_string(),
+                    excess0.to_dec_string(), excess1.to_dec_string(),
+                    self.idle0.to_dec_string(), self.idle1.to_dec_string());
+            }
         } else {
             // Deleverage: asymmetric partial withdrawal (matches TS useAsymmetricDeleverage=true)
             let price_wad = Self::pool_price(pool.sqrt_price_x96());
@@ -1270,6 +1291,29 @@ impl Vault {
         (pool_pos.tokens_owed_0 + est0, pool_pos.tokens_owed_1 + est1)
     }
 
+    pub fn all_fees_pub(&self, pool: &CorePool) -> (U256, U256) { self.all_fees(pool) }
+    pub fn print_position_details(&self, pool: &CorePool) {
+        let sqrt_price = pool.sqrt_price_x96();
+        let names = ["wide", "base", "limit"];
+        let positions = [&self.wide, &self.base, &self.limit];
+        for (i, pos) in positions.iter().enumerate() {
+            if let Some(p) = pos {
+                let pool_pos = pool.position_manager().get_position_readonly(
+                    MANAGER, p.tick_lower, p.tick_upper,
+                );
+                let (lp0, lp1) = amounts_for_liquidity_round(
+                    sqrt_price, p.tick_lower, p.tick_upper, p.liquidity, true,
+                );
+                let (pf0, pf1) = self.position_fees(pool, p);
+                eprintln!("[DEV-POS] {} [{},{}] liq={} lp0={} lp1={} owed0={} owed1={} fees0={} fees1={}",
+                    names[i], p.tick_lower, p.tick_upper,
+                    p.liquidity.to_dec_string(),
+                    lp0.to_dec_string(), lp1.to_dec_string(),
+                    pool_pos.tokens_owed_0.to_dec_string(), pool_pos.tokens_owed_1.to_dec_string(),
+                    pf0.to_dec_string(), pf1.to_dec_string());
+            }
+        }
+    }
     fn all_fees(&self, pool: &CorePool) -> (U256, U256) {
         let mut f0 = U256::ZERO;
         let mut f1 = U256::ZERO;
@@ -1312,6 +1356,23 @@ impl Vault {
         (lp0 + fees0 + self.idle0, lp1 + fees1 + self.idle1)
     }
 
+    pub fn lp_amounts_round_up(&self, pool: &CorePool) -> (U256, U256) {
+        let sqrt_price = pool.sqrt_price_x96();
+        let mut total0 = U256::ZERO;
+        let mut total1 = U256::ZERO;
+        for pos in [&self.wide, &self.base, &self.limit] {
+            if let Some(p) = pos {
+                if !p.liquidity.is_zero() {
+                    let (a0, a1) = amounts_for_liquidity_round(
+                        sqrt_price, p.tick_lower, p.tick_upper, p.liquidity, true,
+                    );
+                    total0 = total0 + a0;
+                    total1 = total1 + a1;
+                }
+            }
+        }
+        (total0, total1)
+    }
     pub fn total_amounts_round_up(&self, pool: &CorePool) -> (U256, U256) {
         let sqrt_price = pool.sqrt_price_x96();
         let mut total0 = U256::ZERO;
@@ -1365,7 +1426,7 @@ impl Vault {
         let price_wad = Self::pool_price(sqrt);
         let w = wad();
 
-        let (total0, total1) = self.total_amounts(pool);
+        let (total0, total1) = self.total_amounts_round_up(pool);
 
         let (volatile_amt, stable_amt) = if self.pool_config.is_volatile_token0() {
             (total0, total1)
@@ -1419,11 +1480,23 @@ impl Vault {
         let half_bps = U256::from_u128(5_000);
         let half = total_value >> 1;
         let stable_share_bps = (stable_amt * bps_scale + half) / total_value;
-        if stable_share_bps > half_bps {
+        let result = if stable_share_bps > half_bps {
             (stable_share_bps - half_bps).lo as u64
         } else {
             (half_bps - stable_share_bps).lo as u64
+        };
+        if result == 100 {
+            static DEV_EDGE_CTR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let idx = DEV_EDGE_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if idx < 5 {
+                eprintln!("[DEV-EDGE] dev={} stableAmt={} volAmt={} volValStable={} totalVal={} stableShareBps={} priceWad={} sqrt={} idle0={} idle1={}",
+                    result, stable_amt.to_dec_string(), volatile_amt.to_dec_string(),
+                    volatile_value_stable.to_dec_string(), total_value.to_dec_string(),
+                    stable_share_bps.to_dec_string(), price_wad.to_dec_string(),
+                    sqrt.to_dec_string(), self.idle0.to_dec_string(), self.idle1.to_dec_string());
+            }
         }
+        result
     }
 
     pub fn collateral_ratio_pct(&self, pool: &CorePool, override_sqrt: Option<U256>) -> f64 {

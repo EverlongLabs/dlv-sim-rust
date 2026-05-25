@@ -399,10 +399,24 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             // Dispatch order: REGULATE_DEBT → DLV → ALM → (replay events)
 
             // Regulate debt (runs FIRST in event-replay mode)
+            if tick_count >= 551063 && tick_count <= 551071 {
+                eprintln!("[TICK-DBG] tick={} BEFORE-RD idle0={} idle1={} baseLiq={} limitLiq={}",
+                    tick_count, vault.idle0.to_dec_string(), vault.idle1.to_dec_string(),
+                    vault.base.as_ref().map(|p| p.liquidity).unwrap_or(U256::ZERO).to_dec_string(),
+                    vault.limit.as_ref().map(|p| p.liquidity).unwrap_or(U256::ZERO).to_dec_string());
+            }
             dispatch_regulate_debt(cfg, &mut vault, &mut pool, target_cr_wad, &mut regulate_debt_calls);
+            if tick_count >= 551063 && tick_count <= 551071 {
+                eprintln!("[TICK-DBG] tick={} AFTER-RD idle0={} idle1={}",
+                    tick_count, vault.idle0.to_dec_string(), vault.idle1.to_dec_string());
+            }
 
             // DLV
             dispatch_dlv(cfg, &mut vault, &mut pool, target_cr_wad, w_const, curr_ms, &mut dlv_calls);
+            if tick_count >= 551063 && tick_count <= 551071 {
+                eprintln!("[TICK-DBG] tick={} AFTER-DLV idle0={} idle1={} dlvCalls={}",
+                    tick_count, vault.idle0.to_dec_string(), vault.idle1.to_dec_string(), dlv_calls);
+            }
 
             // ALM
             dispatch_alm(cfg, &mut vault, &mut pool, ext_sqrt, curr_ms, &mut alm_calls, tick_count);
@@ -751,6 +765,21 @@ fn dispatch_alm(
         (false, 0)
     };
 
+    if false && tick_count == 1514949 {
+        let (t0, t1) = vault.total_amounts_round_up(pool);
+        let (f0, f1) = vault.all_fees_pub(pool);
+        let (lp0, lp1) = vault.lp_amounts_round_up(pool);
+        eprintln!("[DEV-EDGE] tick={} dev_bps={} t0={} t1={} lp0={} lp1={} fees0={} fees1={} idle0={} idle1={} priceWad={} sqrt={} poolTick={}",
+            tick_count, dev_bps_val, t0.to_dec_string(), t1.to_dec_string(),
+            lp0.to_dec_string(), lp1.to_dec_string(),
+            f0.to_dec_string(), f1.to_dec_string(),
+            vault.idle0.to_dec_string(), vault.idle1.to_dec_string(),
+            Vault::pool_price(pool.sqrt_price_x96()).to_dec_string(),
+            pool.sqrt_price_x96().to_dec_string(),
+            pool.tick_current());
+        vault.print_position_details(pool);
+    }
+
     static ALM_DBG_RATIO: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     static ALM_DBG_PRINT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -764,44 +793,44 @@ fn dispatch_alm(
 
     if ratio_trigger {
         let dbg_idx = ALM_DBG_RATIO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if dbg_idx < 10 {
-            let dev_before = vault.share_deviation_bps(pool, None);
-            let (t0b, t1b) = vault.total_amounts_round_up(pool);
-            eprintln!("[ALM-RATIO] #{} BEFORE: dev_bps={} t0={} t1={} idle0={} idle1={} poolTick={} poolSqrt={}",
-                dbg_idx, dev_before,
-                t0b.to_dec_string(), t1b.to_dec_string(),
+        vault.withdraw_all(pool);
+        if *alm_calls >= 391 && *alm_calls <= 395 {
+            eprintln!("[ALM-STEP] alm#{} tick={} AFTER-WITHDRAW idle0={} idle1={} poolTick={}",
+                *alm_calls + 1, tick_count,
                 vault.idle0.to_dec_string(), vault.idle1.to_dec_string(),
-                pool.tick_current(), pool.sqrt_price_x96().to_dec_string());
-
-            vault.withdraw_all(pool);
-            let dev_w = vault.share_deviation_bps(pool, None);
-            eprintln!("[ALM-RATIO] #{} AFTER-WITHDRAW: dev_bps={} idle0={} idle1={}",
-                dbg_idx, dev_w,
+                pool.tick_current());
+        }
+        vault.active_rebalance_swap(None, pool, cfg.dlv.debt_to_volatile_swap_fee);
+        if *alm_calls >= 391 && *alm_calls <= 395 {
+            eprintln!("[ALM-STEP] alm#{} tick={} AFTER-SWAP idle0={} idle1={}",
+                *alm_calls + 1, tick_count,
                 vault.idle0.to_dec_string(), vault.idle1.to_dec_string());
-
-            vault.active_rebalance_swap(None, pool, cfg.dlv.debt_to_volatile_swap_fee);
-            let dev_s = vault.share_deviation_bps(pool, None);
-            eprintln!("[ALM-RATIO] #{} AFTER-SWAP: dev_bps={} idle0={} idle1={}",
-                dbg_idx, dev_s,
+        }
+        vault.rebalance_from_idle(pool);
+        if *alm_calls >= 391 && *alm_calls <= 395 {
+            let bl = vault.base.as_ref().map(|p| p.liquidity).unwrap_or(U256::ZERO);
+            let ll = vault.limit.as_ref().map(|p| p.liquidity).unwrap_or(U256::ZERO);
+            eprintln!("[ALM-STEP] alm#{} tick={} AFTER-DEPLOY baseLiq={} limitLiq={} idle0={} idle1={}",
+                *alm_calls + 1, tick_count, bl.to_dec_string(), ll.to_dec_string(),
                 vault.idle0.to_dec_string(), vault.idle1.to_dec_string());
-
-            vault.rebalance_from_idle(pool);
-            let dev_a = vault.share_deviation_bps(pool, None);
-            let (t0a, t1a) = vault.total_amounts_round_up(pool);
-            eprintln!("[ALM-RATIO] #{} AFTER-DEPLOY: dev_bps={} t0={} t1={} idle0={} idle1={}",
-                dbg_idx, dev_a,
-                t0a.to_dec_string(), t1a.to_dec_string(),
-                vault.idle0.to_dec_string(), vault.idle1.to_dec_string());
-        } else {
-            vault.withdraw_all(pool);
-            vault.active_rebalance_swap(None, pool, cfg.dlv.debt_to_volatile_swap_fee);
-            vault.rebalance_from_idle(pool);
         }
         vault.last_rebalance_ms = curr_ms;
         *alm_calls += 1;
+        {
+            let bl = vault.base.as_ref().map(|p| p.liquidity).unwrap_or(U256::ZERO);
+            let ll = vault.limit.as_ref().map(|p| p.liquidity).unwrap_or(U256::ZERO);
+            eprintln!("[ALM-LOG] tick={} type=ratio dev_bps={} alm_count={} baseLiq={} limitLiq={}",
+                tick_count, dev_bps_val, *alm_calls, bl.to_dec_string(), ll.to_dec_string());
+        }
     } else if time_trigger {
         vault.last_rebalance_ms = curr_ms;
         *alm_calls += 1;
+        {
+            let bl = vault.base.as_ref().map(|p| p.liquidity).unwrap_or(U256::ZERO);
+            let ll = vault.limit.as_ref().map(|p| p.liquidity).unwrap_or(U256::ZERO);
+            eprintln!("[ALM-LOG] tick={} type=time alm_count={} baseLiq={} limitLiq={}",
+                tick_count, *alm_calls, bl.to_dec_string(), ll.to_dec_string());
+        }
     }
 }
 
