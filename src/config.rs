@@ -49,6 +49,7 @@ pub struct Config {
     pub dlv: DlvParams,
     pub arb: ArbParams,
     pub active_rebalance_ratio_deviation_bps: u32,
+    pub max_ticks: Option<u64>,
 }
 
 impl Config {
@@ -110,6 +111,10 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(100);
 
+        let max_ticks: Option<u64> = std::env::var("BF_MAX_TICKS")
+            .ok()
+            .and_then(|s| s.parse().ok());
+
         Config {
             pool_selection,
             pool_config,
@@ -124,6 +129,7 @@ impl Config {
             dlv,
             arb,
             active_rebalance_ratio_deviation_bps,
+            max_ticks,
         }
     }
 

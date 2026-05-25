@@ -54,8 +54,8 @@ fn mul_shift(val: U256, mul_by: U256) -> U256 {
     let (lo, hi) = val.full_mul(mul_by);
     // Shift 512-bit result right by 128
     U256::new(
-        (lo.hi) | (hi.lo.wrapping_shl(0)), // lo bits [128..255] become lo[0..127]
-        hi.lo,                               // hi bits [0..127] become hi[0..127]
+        lo.hi,
+        hi.lo,
     )
 }
 
@@ -201,10 +201,37 @@ mod tests {
     #[test]
     fn test_tick_spacing_to_max_liquidity_per_tick_60() {
         let result = tick_spacing_to_max_liquidity_per_tick(60);
-        // Known value: 11505743598341114571880798222544994
         assert_eq!(
             result.to_dec_string(),
             "11505743598341114571880798222544994"
         );
+    }
+
+    #[test]
+    fn test_get_tick_at_cbbtc_usdc_sqrt_price() {
+        let sqrt_price = U256::from_dec_str("3285408384947305614870777361");
+        let tick = get_tick_at_sqrt_ratio(sqrt_price);
+        println!("tick for sqrtPrice 3285408384947305614870777361 = {}", tick);
+
+        // TS returns -70235 for this sqrtPriceX96
+        // Check what Rust returns and what get_sqrt_ratio_at_tick gives for known ticks
+        let sr_neg70235 = get_sqrt_ratio_at_tick(-70235);
+        let sr_neg70234 = get_sqrt_ratio_at_tick(-70234);
+        let sr_neg63660 = get_sqrt_ratio_at_tick(-63660);
+        let sr_neg63659 = get_sqrt_ratio_at_tick(-63659);
+        println!("getSqrtRatio(-70235) = {}", sr_neg70235);
+        println!("getSqrtRatio(-70234) = {}", sr_neg70234);
+        println!("getSqrtRatio(-63660) = {}", sr_neg63660);
+        println!("getSqrtRatio(-63659) = {}", sr_neg63659);
+        println!("input sqrtPrice      = {}", sqrt_price);
+
+        // Check: -70235 should satisfy: getSqrtRatio(-70235) <= sqrtPrice < getSqrtRatio(-70234)
+        println!("sr(-70235) <= input? {}", sr_neg70235 <= sqrt_price);
+        println!("sr(-70234) >  input? {}", sr_neg70234 > sqrt_price);
+        // Check: -63660
+        println!("sr(-63660) <= input? {}", sr_neg63660 <= sqrt_price);
+        println!("sr(-63659) >  input? {}", sr_neg63659 > sqrt_price);
+
+        assert_eq!(tick, -70235, "Expected tick -70235 but got {}", tick);
     }
 }

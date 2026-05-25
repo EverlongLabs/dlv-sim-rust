@@ -91,6 +91,40 @@ impl TickManager {
         }
     }
 
+    pub fn get_fee_growth_inside_readonly(
+        &self,
+        tick_lower: i32,
+        tick_upper: i32,
+        tick_current: i32,
+        fee_growth_global_0_x128: U256,
+        fee_growth_global_1_x128: U256,
+    ) -> (U256, U256) {
+        let lower = self.get_tick_readonly(tick_lower);
+        let upper = self.get_tick_readonly(tick_upper);
+
+        let (fee_growth_below_0, fee_growth_below_1) = if tick_current >= tick_lower {
+            (lower.fee_growth_outside_0_x128, lower.fee_growth_outside_1_x128)
+        } else {
+            (
+                full_math::mod256_sub(fee_growth_global_0_x128, lower.fee_growth_outside_0_x128),
+                full_math::mod256_sub(fee_growth_global_1_x128, lower.fee_growth_outside_1_x128),
+            )
+        };
+        let (fee_growth_above_0, fee_growth_above_1) = if tick_current < tick_upper {
+            (upper.fee_growth_outside_0_x128, upper.fee_growth_outside_1_x128)
+        } else {
+            (
+                full_math::mod256_sub(fee_growth_global_0_x128, upper.fee_growth_outside_0_x128),
+                full_math::mod256_sub(fee_growth_global_1_x128, upper.fee_growth_outside_1_x128),
+            )
+        };
+
+        (
+            full_math::mod256_sub(full_math::mod256_sub(fee_growth_global_0_x128, fee_growth_below_0), fee_growth_above_0),
+            full_math::mod256_sub(full_math::mod256_sub(fee_growth_global_1_x128, fee_growth_below_1), fee_growth_above_1),
+        )
+    }
+
     /// Get fee growth inside a tick range
     pub fn get_fee_growth_inside(
         &mut self,

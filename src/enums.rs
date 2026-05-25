@@ -52,19 +52,17 @@ pub enum Rebalance {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventType {
-    Mint = 0,
-    Burn = 1,
-    Swap = 2,
-    Collect = 3,
+    Mint = 1,
+    Burn = 2,
+    Swap = 3,
 }
 
 impl EventType {
     pub fn from_i32(v: i32) -> Self {
         match v {
-            0 => Self::Mint,
-            1 => Self::Burn,
-            2 => Self::Swap,
-            3 => Self::Collect,
+            1 => Self::Mint,
+            2 => Self::Burn,
+            3 => Self::Swap,
             _ => panic!("Unknown EventType: {}", v),
         }
     }
