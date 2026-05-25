@@ -9,6 +9,22 @@ use crate::pool_config::PoolConfig;
 
 const MANAGER: &str = "0xVAULT_MANAGER";
 
+#[derive(Debug)]
+struct RebalanceResult {
+    mode: u8,
+    amount: U256,
+    swap_fee: U256,
+    shares_to_burn: U256,
+    withdraw_stable: U256,
+    withdraw_volatile: U256,
+}
+
+impl RebalanceResult {
+    fn noop() -> Self {
+        Self { mode: 0, amount: U256::ZERO, swap_fee: U256::ZERO, shares_to_burn: U256::ZERO, withdraw_stable: U256::ZERO, withdraw_volatile: U256::ZERO }
+    }
+}
+
 fn wad() -> U256 { U256::from_u128(1_000_000_000_000_000_000) }
 
 fn max_liquidity_for_amounts(
@@ -311,11 +327,11 @@ impl Vault {
     fn rebalance_borrowed_amount(
         &self, pool: &CorePool, override_sqrt: Option<U256>,
         target_cr_wad: U256, swap_fee: f64,
-    ) -> (u8, U256, U256) {
+    ) -> RebalanceResult {
         let w = wad();
         let sqrt = override_sqrt.unwrap_or_else(|| pool.sqrt_price_x96());
         let price_wad = Self::pool_price(sqrt);
-        if price_wad.is_zero() { return (0, U256::ZERO, U256::ZERO); }
+        if price_wad.is_zero() { return RebalanceResult::noop(); }
 
         let (total0, total1) = self.total_amounts(pool);
         let (total0_ru, total1_ru) = self.total_amounts_round_up(pool);
@@ -349,6 +365,22 @@ impl Vault {
         };
         let r_plus_1_wad = rw + w;
 
+        static DLV_DIAG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dlv_log = DLV_DIAG.load(std::sync::atomic::Ordering::Relaxed) < 5;
+
+        if dlv_log {
+            eprintln!("[DLV-RBA] INPUTS total0={} total1={} total0_ru={} total1_ru={}",
+                total0.to_dec_string(), total1.to_dec_string(),
+                total0_ru.to_dec_string(), total1_ru.to_dec_string());
+            eprintln!("[DLV-RBA] volatile0={} stable0={} D0={} priceWad={}",
+                volatile0.to_dec_string(), stable0.to_dec_string(),
+                d0.to_dec_string(), price_wad.to_dec_string());
+            eprintln!("[DLV-RBA] volatileValStable={} V0={} targetV0={} Rw={} idle0={} idle1={}",
+                volatile_val_stable.to_dec_string(), v0.to_dec_string(),
+                target_v0.to_dec_string(), rw.to_dec_string(),
+                self.idle0.to_dec_string(), self.idle1.to_dec_string());
+        }
+
         if v0 > target_v0 {
             // ===== LEVERAGE =====
             let term_r_1_minus_f = full_math::mul_div(rw, one_minus_fee, fee_den);
@@ -357,13 +389,20 @@ impl Vault {
             let surplus = v0 - target_v0;
 
             let b = full_math::mul_div(surplus, denom_wad, denom_plus_fee_wad);
-            if b.is_zero() { return (0, U256::ZERO, U256::ZERO); }
+            if b.is_zero() { return RebalanceResult::noop(); }
 
             let mut x = full_math::mul_div(b, w, denom_wad);
             let mut swap_fee_usdc = full_math::mul_div(x, fee_num, fee_den);
             let x_eff = if x > swap_fee_usdc { x - swap_fee_usdc } else { U256::ZERO };
             let mut volatile_received = self.stable_to_volatile_val(x_eff, price_wad);
             let mut stable_deposit_plan = if b > x { b - x } else { U256::ZERO };
+
+            if dlv_log {
+                eprintln!("[DLV-RBA] LEVERAGE surplus={} B={} X={} swapFee={} xEff={} volReceived={} stableDepositPlan={}",
+                    surplus.to_dec_string(), b.to_dec_string(), x.to_dec_string(),
+                    swap_fee_usdc.to_dec_string(), x_eff.to_dec_string(),
+                    volatile_received.to_dec_string(), stable_deposit_plan.to_dec_string());
+            }
 
             // ── robust pair selection (matches TS when thresholds < 1.0) ──
             // TS uses raw token amounts for rRU/rRD (not value-converted),
@@ -472,7 +511,15 @@ impl Vault {
                 }
             }
 
-            if best_borrow.is_zero() { return (0, U256::ZERO, U256::ZERO); }
+            if dlv_log {
+                eprintln!("[DLV-RBA] BSEARCH borrowTarget={} bestBorrow={} bestDiff={} reqStable={} stableDepPlan={}",
+                    borrow_target.to_dec_string(), best_borrow.to_dec_string(),
+                    best_diff.to_dec_string(), required_stable.to_dec_string(),
+                    stable_deposit_plan.to_dec_string());
+                DLV_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            if best_borrow.is_zero() { return RebalanceResult::noop(); }
 
             // Compute swap fee for the best borrow (matches TS computeScaledPlan)
             let st_scaled_final = if required_stable.is_zero() {
@@ -484,14 +531,19 @@ impl Vault {
             let swap_scaled_final = if best_borrow > st_scaled_final { best_borrow - st_scaled_final } else { U256::ZERO };
             let swap_fee_final = full_math::mul_div(swap_scaled_final, fee_num, fee_den);
 
-            (1, best_borrow, swap_fee_final)
+            RebalanceResult { mode: 1, amount: best_borrow, swap_fee: swap_fee_final, shares_to_burn: U256::ZERO, withdraw_stable: U256::ZERO, withdraw_volatile: U256::ZERO }
         } else if target_v0 > v0 {
             // ===== DELEVERAGE =====
             let two_f_wad = f_wad * U256::from_u128(2);
             let denom_del_term = full_math::mul_div(two_f_wad, w, r_plus_1_wad);
             if denom_del_term >= w {
+                if dlv_log {
+                    eprintln!("[DLV-RBA] DELEV-FALLBACK denomDelTerm={} >= WAD, repay={}",
+                        denom_del_term.to_dec_string(), v0.min(d0).to_dec_string());
+                    DLV_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 let repay = v0.min(d0);
-                return (2, repay, U256::ZERO);
+                return RebalanceResult { mode: 2, amount: repay, swap_fee: U256::ZERO, shares_to_burn: self.total_supply, withdraw_stable: stable0, withdraw_volatile: volatile0 };
             }
             let denom_del_wad = w - denom_del_term;
             let deficit = target_v0 - v0;
@@ -514,9 +566,24 @@ impl Vault {
             };
             let repay = (stable_out + stable_from_volatile).min(d0);
 
-            (2, repay, U256::ZERO)
+            let volatile_out = self.stable_to_volatile_val(volatile_val_out, price_wad);
+            let shares_raw = if v0.is_zero() { U256::ZERO } else { full_math::mul_div(self.total_supply, w_cap, v0) };
+            let shares_to_burn = shares_raw.min(self.total_supply);
+
+            if dlv_log {
+                eprintln!("[DLV-RBA] DELEV deficit={} denomDelWad={} W={} Wcap={} stableOut={} volValOut={} swapFee={} stableFromVol={} repay={} sharesToBurn={} volOut={}",
+                    deficit.to_dec_string(), denom_del_wad.to_dec_string(),
+                    w_val.to_dec_string(), w_cap.to_dec_string(),
+                    stable_out.to_dec_string(), volatile_val_out.to_dec_string(),
+                    swap_fee_del.to_dec_string(), stable_from_volatile.to_dec_string(),
+                    repay.to_dec_string(), shares_to_burn.to_dec_string(),
+                    volatile_out.to_dec_string());
+                DLV_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            RebalanceResult { mode: 2, amount: repay, swap_fee: swap_fee_del, shares_to_burn, withdraw_stable: stable_out, withdraw_volatile: volatile_out }
         } else {
-            (0, U256::ZERO, U256::ZERO)
+            RebalanceResult::noop()
         }
     }
 
@@ -526,18 +593,16 @@ impl Vault {
         let w = wad();
         if target_cr_wad <= w { return; }
 
-        let (mode, amount, swap_fee_stable) = self.rebalance_borrowed_amount(pool, None, target_cr_wad, swap_fee);
-        if mode == 0 || amount.is_zero() { return; }
+        let result = self.rebalance_borrowed_amount(pool, None, target_cr_wad, swap_fee);
+        if result.mode == 0 || result.amount.is_zero() { return; }
 
-        if mode == 1 {
+        if result.mode == 1 {
             // Leverage: match TS rebalanceDebt pro-rata deposit logic
             let sqrt = pool.sqrt_price_x96();
             let price_wad = Self::pool_price(sqrt);
 
-            // net new value added (stable units after swap fee)
-            let net_new_stable = if amount > swap_fee_stable { amount - swap_fee_stable } else { U256::ZERO };
+            let net_new_stable = if result.amount > result.swap_fee { result.amount - result.swap_fee } else { U256::ZERO };
 
-            // Current vault composition (roundDown, matches TS getTotalAmounts(false))
             let (cur0, cur1) = self.total_amounts(pool);
             let (cur_volatile, cur_stable) = if self.pool_config.is_volatile_token0() {
                 (cur0, cur1)
@@ -548,7 +613,6 @@ impl Vault {
             let cur_total = cur_stable + cur_volatile_value;
 
             let (deposit_volatile, deposit_stable) = if cur_total.is_zero() {
-                // Vault empty — fallback (shouldn't happen in normal flow)
                 (U256::ZERO, net_new_stable)
             } else {
                 let stable_frac = full_math::mul_div(cur_stable, w, cur_total);
@@ -564,37 +628,71 @@ impl Vault {
                 (deposit_stable, deposit_volatile)
             };
 
-            // Add debt first (matches TS: virtualDebt += borrowStable)
-            self.virtual_debt = self.virtual_debt + amount;
+            self.virtual_debt = self.virtual_debt + result.amount;
 
-            // Pro-rata deposit into existing positions (matches TS this.deposit())
             let (actual0, actual1) = self.deposit_pro_rata(pool, amount0_desired, amount1_desired);
 
-            // Credit excess to idle (matches TS excess token handling)
             let excess0 = if amount0_desired > actual0 { amount0_desired - actual0 } else { U256::ZERO };
             let excess1 = if amount1_desired > actual1 { amount1_desired - actual1 } else { U256::ZERO };
             if !excess0.is_zero() { self.idle0 = self.idle0 + excess0; }
             if !excess1.is_zero() { self.idle1 = self.idle1 + excess1; }
         } else {
-            // Deleverage: withdraw all, repay debt, swap, redeploy
-            self.withdraw_all(pool);
-            let repay = amount.min(self.virtual_debt);
-            let stable_idle = if self.pool_config.is_volatile_token0() {
-                self.idle1
-            } else {
-                self.idle0
-            };
-            let repay = repay.min(stable_idle);
-            if !repay.is_zero() {
-                self.virtual_debt = self.virtual_debt - repay;
-                if self.pool_config.is_volatile_token0() {
-                    self.idle1 = self.idle1 - repay;
-                } else {
-                    self.idle0 = self.idle0 - repay;
+            // Deleverage: asymmetric partial withdrawal (matches TS useAsymmetricDeleverage=true)
+            let price_wad = Self::pool_price(pool.sqrt_price_x96());
+            let is_vol_t0 = self.pool_config.is_volatile_token0();
+
+            if !result.shares_to_burn.is_zero() && self.total_supply >= result.shares_to_burn {
+                let ts_before = self.total_supply;
+                let pro_rata_idle0 = full_math::mul_div(self.idle0, result.shares_to_burn, ts_before);
+                let pro_rata_idle1 = full_math::mul_div(self.idle1, result.shares_to_burn, ts_before);
+
+                self.total_supply = ts_before - result.shares_to_burn;
+                self.idle0 = self.idle0 - pro_rata_idle0;
+                self.idle1 = self.idle1 - pro_rata_idle1;
+
+                let (pd_out0, pd_out1) = self.partial_deleverage(pool, result.amount, price_wad);
+
+                self.idle0 = self.idle0 - pd_out0;
+                self.idle1 = self.idle1 - pd_out1;
+
+                let actual0 = pro_rata_idle0 + pd_out0;
+                let actual1 = pro_rata_idle1 + pd_out1;
+
+                let actual_volatile = if is_vol_t0 { actual0 } else { actual1 };
+                let actual_stable = if is_vol_t0 { actual1 } else { actual0 };
+
+                let mut actual_debt_decrease = result.amount;
+
+                if actual_volatile > result.withdraw_volatile {
+                    let extra = actual_volatile - result.withdraw_volatile;
+                    let extra_stable = self.volatile_to_stable_val(extra, price_wad);
+                    actual_debt_decrease = actual_debt_decrease + extra_stable;
+                } else if result.withdraw_volatile > actual_volatile {
+                    let missing = result.withdraw_volatile - actual_volatile;
+                    let missing_stable = self.volatile_to_stable_val(missing, price_wad);
+                    actual_debt_decrease = if actual_debt_decrease > missing_stable {
+                        actual_debt_decrease - missing_stable
+                    } else {
+                        U256::ZERO
+                    };
+                }
+
+                if actual_stable > result.withdraw_stable {
+                    actual_debt_decrease = actual_debt_decrease + (actual_stable - result.withdraw_stable);
+                } else if result.withdraw_stable > actual_stable {
+                    let missing = result.withdraw_stable - actual_stable;
+                    actual_debt_decrease = if actual_debt_decrease > missing {
+                        actual_debt_decrease - missing
+                    } else {
+                        U256::ZERO
+                    };
+                }
+
+                actual_debt_decrease = actual_debt_decrease.min(self.virtual_debt);
+                if !actual_debt_decrease.is_zero() {
+                    self.virtual_debt = self.virtual_debt - actual_debt_decrease;
                 }
             }
-            self.active_rebalance_swap(None, pool, swap_fee);
-            self.rebalance_from_idle(pool);
         }
     }
 
@@ -979,6 +1077,144 @@ impl Vault {
                 }
             }
         }
+    }
+
+    fn value_in_stable(&self, amt0: U256, amt1: U256, price_wad: U256) -> U256 {
+        let w = wad();
+        let (volatile, stable) = if self.pool_config.is_volatile_token0() {
+            (amt0, amt1)
+        } else {
+            (amt1, amt0)
+        };
+        let vol_val = self.volatile_to_stable_val(volatile, price_wad);
+        stable + vol_val
+    }
+
+    fn partial_deleverage(&mut self, pool: &mut CorePool, target_stable: U256, price_wad: U256) -> (U256, U256) {
+        let sqrt_price = pool.sqrt_price_x96();
+        let mut remaining = target_stable;
+        let mut total_out0 = U256::ZERO;
+        let mut total_out1 = U256::ZERO;
+
+        for pos_idx in [2, 1, 0] {
+            if remaining.is_zero() { break; }
+            let (tick_lower, tick_upper, liq) = match pos_idx {
+                0 => match &self.wide { Some(p) => (p.tick_lower, p.tick_upper, p.liquidity), None => continue },
+                1 => match &self.base { Some(p) => (p.tick_lower, p.tick_upper, p.liquidity), None => continue },
+                2 => match &self.limit { Some(p) => (p.tick_lower, p.tick_upper, p.liquidity), None => continue },
+                _ => unreachable!(),
+            };
+            if liq.is_zero() { continue; }
+
+            let (amt0, amt1) = amounts_for_liquidity(sqrt_price, tick_lower, tick_upper, liq);
+            let range_value = self.value_in_stable(amt0, amt1, price_wad);
+            if range_value.is_zero() { continue; }
+
+            let liq_to_burn = if remaining >= range_value {
+                liq
+            } else {
+                let l = full_math::mul_div(liq, remaining, range_value);
+                if l.is_zero() { continue; }
+                l
+            };
+
+            let (burned0, burned1) = pool.burn(MANAGER, tick_lower, tick_upper, I256(liq_to_burn));
+            let (coll0, coll1) = pool.collect(MANAGER, tick_lower, tick_upper, MAX_UINT128, MAX_UINT128);
+
+            self.idle0 = self.idle0 + coll0;
+            self.idle1 = self.idle1 + coll1;
+            self.compensate_burn_rounding(pool.tick_current(), tick_lower, tick_upper, burned0, burned1);
+
+            total_out0 = total_out0 + coll0;
+            total_out1 = total_out1 + coll1;
+
+            let withdrawn_value = self.value_in_stable(coll0, coll1, price_wad);
+            remaining = if remaining > withdrawn_value { remaining - withdrawn_value } else { U256::ZERO };
+
+            match pos_idx {
+                0 => if let Some(p) = &mut self.wide { p.liquidity = p.liquidity - liq_to_burn; },
+                1 => if let Some(p) = &mut self.base { p.liquidity = p.liquidity - liq_to_burn; },
+                2 => if let Some(p) = &mut self.limit { p.liquidity = p.liquidity - liq_to_burn; },
+                _ => {}
+            }
+        }
+
+        (total_out0, total_out1)
+    }
+
+    pub fn withdraw_shares(&mut self, pool: &mut CorePool, shares: U256) -> (U256, U256) {
+        if shares.is_zero() { return (U256::ZERO, U256::ZERO); }
+        let ts = self.total_supply;
+        if ts.is_zero() { return (U256::ZERO, U256::ZERO); }
+
+        self.total_supply = ts - shares;
+
+        let mut out0 = full_math::mul_div(self.idle0, shares, ts);
+        let mut out1 = full_math::mul_div(self.idle1, shares, ts);
+
+        static WS_DIAG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let ws_log = WS_DIAG.load(std::sync::atomic::Ordering::Relaxed) < 3;
+        if ws_log {
+            eprintln!("[WS] shares={} ts={} idle0={} idle1={} proRataIdle0={} proRataIdle1={}",
+                shares.to_dec_string(), ts.to_dec_string(),
+                self.idle0.to_dec_string(), self.idle1.to_dec_string(),
+                out0.to_dec_string(), out1.to_dec_string());
+        }
+
+        for pos_idx in 0..3 {
+            let (tick_lower, tick_upper, liq) = match pos_idx {
+                0 => match &self.wide { Some(p) => (p.tick_lower, p.tick_upper, p.liquidity), None => continue },
+                1 => match &self.base { Some(p) => (p.tick_lower, p.tick_upper, p.liquidity), None => continue },
+                2 => match &self.limit { Some(p) => (p.tick_lower, p.tick_upper, p.liquidity), None => continue },
+                _ => unreachable!(),
+            };
+            if liq.is_zero() { continue; }
+            let liq_share = full_math::mul_div(liq, shares, ts);
+            if liq_share.is_zero() { continue; }
+
+            let (burned0, burned1) = pool.burn(MANAGER, tick_lower, tick_upper, I256(liq_share));
+            let (coll0, coll1) = pool.collect(MANAGER, tick_lower, tick_upper, MAX_UINT128, MAX_UINT128);
+
+            let b0 = if burned0 > I256::ZERO { burned0.0 } else { U256::ZERO };
+            let b1 = if burned1 > I256::ZERO { burned1.0 } else { U256::ZERO };
+            let fees0 = if coll0 > b0 { coll0 - b0 } else { U256::ZERO };
+            let fees1 = if coll1 > b1 { coll1 - b1 } else { U256::ZERO };
+
+            if ws_log {
+                eprintln!("[WS] pos#{} [{},{}] liq={} liqShare={} burned=({},{}) coll=({},{}) fees=({},{})",
+                    pos_idx, tick_lower, tick_upper, liq.to_dec_string(), liq_share.to_dec_string(),
+                    b0.to_dec_string(), b1.to_dec_string(),
+                    coll0.to_dec_string(), coll1.to_dec_string(),
+                    fees0.to_dec_string(), fees1.to_dec_string());
+            }
+
+            self.idle0 = self.idle0 + coll0;
+            self.idle1 = self.idle1 + coll1;
+            self.compensate_burn_rounding(pool.tick_current(), tick_lower, tick_upper, burned0, burned1);
+
+            let v0 = full_math::mul_div(fees0, shares, ts);
+            let v1 = full_math::mul_div(fees1, shares, ts);
+
+            out0 = out0 + b0 + v0;
+            out1 = out1 + b1 + v1;
+
+            match pos_idx {
+                0 => if let Some(p) = &mut self.wide { p.liquidity = p.liquidity - liq_share; },
+                1 => if let Some(p) = &mut self.base { p.liquidity = p.liquidity - liq_share; },
+                2 => if let Some(p) = &mut self.limit { p.liquidity = p.liquidity - liq_share; },
+                _ => {}
+            }
+        }
+
+        if ws_log {
+            eprintln!("[WS] TOTAL out0={} out1={}", out0.to_dec_string(), out1.to_dec_string());
+            WS_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        self.idle0 = self.idle0 - out0;
+        self.idle1 = self.idle1 - out1;
+
+        (out0, out1)
     }
 
     fn compensate_burn_rounding(&mut self, tick: i32, lo: i32, hi: i32, burned0: I256, burned1: I256) {

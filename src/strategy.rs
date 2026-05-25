@@ -716,7 +716,15 @@ fn dispatch_dlv(
                 }
             }
             if needs_dlv {
+                let debt_before = vault.virtual_debt;
                 vault.rebalance_debt_dlv(pool, target_cr_wad, cfg.dlv.debt_to_volatile_swap_fee);
+                let debt_after = vault.virtual_debt;
+                eprintln!("[DLV-ACT] debtBefore={} debtAfter={} diff={} idle0={} idle1={} totalSupply={}",
+                    debt_before.to_dec_string(), debt_after.to_dec_string(),
+                    if debt_before > debt_after { format!("-{}", (debt_before - debt_after).to_dec_string()) }
+                    else { format!("+{}", (debt_after - debt_before).to_dec_string()) },
+                    vault.idle0.to_dec_string(), vault.idle1.to_dec_string(),
+                    vault.total_supply.to_dec_string());
                 vault.last_rebalance_ms = curr_ms;
                 vault.last_debt_rebalance_ms = curr_ms;
                 *dlv_calls += 1;
