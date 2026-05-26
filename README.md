@@ -13,7 +13,7 @@ Rust port of the TypeScript DLV vault simulator. Produces matching output given 
 
 ```bash
 # Rust
-docker compose run --rm -e BF_POOL=cbbtc_usdc_base dlv-sim 2>&1 | grep RESULT_JSON
+docker compose run --rm -e BF_POOL=cbbtc_usdc_base -e ARB_STRATEGY=false dlv-sim 2>&1 | grep RESULT_JSON
 
 # TypeScript
 cd ../dlv-sim && docker compose run --rm \
@@ -26,7 +26,7 @@ cd ../dlv-sim && docker compose run --rm \
 
 ```bash
 # Rust
-docker compose run --rm -e BF_POOL=wbtc_usdc dlv-sim 2>&1 | grep RESULT_JSON
+docker compose run --rm -e BF_POOL=wbtc_usdc -e ARB_STRATEGY=false dlv-sim 2>&1 | grep RESULT_JSON
 
 # TypeScript
 cd ../dlv-sim && docker compose run --rm \
