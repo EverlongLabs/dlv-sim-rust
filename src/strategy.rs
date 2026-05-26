@@ -345,8 +345,15 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
     let step_ms = (cfg.lookup_period as i64) * 1000;
     let mut curr_ms = start_ms;
 
+    // Pre-replay state (only set in event-replay mode; TS computes CR and
+    // SNAPSHOT btcValue before replay events shift the pool price)
+    let mut pre_replay_cr_pct: Option<f64> = None;
+    let mut pre_replay_snapshot_btc_value: Option<f64> = None;
+
     while curr_ms < end_ms {
         tick_count += 1;
+        pre_replay_cr_pct = None;
+        pre_replay_snapshot_btc_value = None;
         if let Some(max) = cfg.max_ticks {
             if tick_count > max { break; }
         }
@@ -360,6 +367,14 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
         let prev_alm = alm_calls;
         let prev_dlv = dlv_calls;
         let mut _rd_fired = false;
+        // TS captures snapshot price BEFORE each rebalance (collectVaultSnapshotInputs
+        // runs before the swap). Track per-event pre-dispatch sqrt for btcValue computation.
+        let mut dlv_pre_sqrt = U256::ZERO;
+        let mut alm_pre_sqrt = U256::ZERO;
+        // Intermediate NAV: TS computes vaultValue AFTER each dispatch using the
+        // post-dispatch pool state. We capture these at intermediate points.
+        let mut dlv_nav = U256::ZERO;
+        let mut alm_nav = U256::ZERO;
 
         if cfg.is_arb_strategy {
             // ── ARB-ONLY MODE ──
@@ -392,10 +407,14 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             }
 
             // DLV
+            dlv_pre_sqrt = pool.sqrt_price_x96();
             dispatch_dlv(cfg, &mut vault, &mut pool, target_cr_wad, w_const, curr_ms, &mut dlv_calls);
+            dlv_nav = vault.total_pool_value(&pool, None);
 
             // ALM
+            alm_pre_sqrt = pool.sqrt_price_x96();
             dispatch_alm(cfg, &mut vault, &mut pool, ext_sqrt, curr_ms, &mut alm_calls, tick_count);
+            alm_nav = vault.total_pool_value(&pool, None);
 
             // Regulate debt (runs LAST in arb mode)
             _rd_fired = dispatch_regulate_debt(cfg, &mut vault, &mut pool, target_cr_wad, &mut regulate_debt_calls);
@@ -407,10 +426,14 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             _rd_fired = dispatch_regulate_debt(cfg, &mut vault, &mut pool, target_cr_wad, &mut regulate_debt_calls);
 
             // DLV
+            dlv_pre_sqrt = pool.sqrt_price_x96();
             dispatch_dlv(cfg, &mut vault, &mut pool, target_cr_wad, w_const, curr_ms, &mut dlv_calls);
+            dlv_nav = vault.total_pool_value(&pool, None);
 
             // ALM
+            alm_pre_sqrt = pool.sqrt_price_x96();
             dispatch_alm(cfg, &mut vault, &mut pool, ext_sqrt, curr_ms, &mut alm_calls, tick_count);
+            alm_nav = vault.total_pool_value(&pool, None);
 
             // Per-tick diagnostic (env TICK_DIAG=N to print first N ticks)
             if let Some(diag_limit) = std::env::var("TICK_DIAG").ok().and_then(|v| v.parse::<u64>().ok()) {
@@ -424,6 +447,17 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
                         vault.virtual_debt.to_dec_string(),
                         alm_calls, dlv_calls, regulate_debt_calls);
                 }
+            }
+
+            // Capture pre-replay state for metrics (TS computes CR and
+            // SNAPSHOT btcValue before replay events shift the pool price)
+            pre_replay_cr_pct = Some(vault.collateral_ratio_pct(&pool, None));
+            {
+                let s = pool.sqrt_price_x96();
+                let v = vault.total_pool_value(&pool, None).lo as f64
+                    / 10f64.powi(cfg.pool_config.stable_decimals() as i32);
+                let p = Vault::volatile_price_wad(s, cfg.pool_config.is_volatile_token0()).lo as f64 / 1e18;
+                if p > 0.0 { pre_replay_snapshot_btc_value = Some(v / p); }
             }
 
             // Replay events up to next period boundary
@@ -464,19 +498,38 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
         let price_f = vol_price_wad.lo as f64 / 1e18;
 
         // TS registers ALM, DLV, and SNAPSHOT entries independently per tick.
-        // On overlap ticks (event + idle), duplicates match TS array length.
-        let register_count = (alm_fired as u8) + (dlv_fired as u8) + (idle_snapshot_due as u8);
-        if register_count > 0 && price_f > 0.0 {
-            let btc_value = vault_value_f / price_f;
+        // Each entry uses its own price/NAV: event entries use pre-dispatch price
+        // and post-dispatch NAV; idle snapshots use post-all-dispatch price and NAV.
+        let is_vol_t0 = cfg.pool_config.is_volatile_token0();
+        let stable_scale = 10f64.powi(cfg.pool_config.stable_decimals() as i32);
+        let mut tick_btc_values: Vec<f64> = Vec::with_capacity(3);
+
+        if dlv_fired {
+            let p = Vault::volatile_price_wad(dlv_pre_sqrt, is_vol_t0).lo as f64 / 1e18;
+            let v = dlv_nav.lo as f64 / stable_scale;
+            if p > 0.0 { tick_btc_values.push(v / p); }
+        }
+        if alm_fired {
+            let p = Vault::volatile_price_wad(alm_pre_sqrt, is_vol_t0).lo as f64 / 1e18;
+            let v = alm_nav.lo as f64 / stable_scale;
+            if p > 0.0 { tick_btc_values.push(v / p); }
+        }
+        if idle_snapshot_due {
+            if let Some(snap_btc) = pre_replay_snapshot_btc_value {
+                tick_btc_values.push(snap_btc);
+            } else if price_f > 0.0 {
+                tick_btc_values.push(vault_value_f / price_f);
+            }
+        }
+
+        for &btc_value in &tick_btc_values {
             if first_apy_value.is_none() {
                 first_apy_value = Some((btc_value, curr_ms as f64));
             }
             last_apy_value = Some((btc_value, curr_ms as f64));
 
             if btc_value > 0.0 && btc_value.is_finite() {
-                for _ in 0..register_count {
-                    btc_values_for_risk.push(btc_value);
-                }
+                btc_values_for_risk.push(btc_value);
 
                 if btc_value > peak_btc_value {
                     peak_btc_value = btc_value;
@@ -495,9 +548,12 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
                     .and_modify(|e| e.1 = btc_value)
                     .or_insert((btc_value, btc_value));
             }
+        }
 
-            if cr_pct.is_finite() && cr_pct > 0.0 && cr_pct < min_cr {
-                min_cr = cr_pct;
+        if !tick_btc_values.is_empty() {
+            let effective_cr = pre_replay_cr_pct.unwrap_or(cr_pct);
+            if effective_cr.is_finite() && effective_cr > 0.0 && effective_cr < min_cr {
+                min_cr = effective_cr;
             }
         }
 
