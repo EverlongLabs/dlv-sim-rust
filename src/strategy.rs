@@ -337,7 +337,6 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
 
     // Event cursor for event-replay mode
     let mut event_cursor: usize = 0;
-
     // Initialize ALM time trigger: TS uses count % period==0, first fires at tick=period.
     // Setting last_rebalance_ms to start_ms prevents spurious first-tick trigger.
     vault.last_rebalance_ms = start_ms;
@@ -360,7 +359,7 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
 
         let prev_alm = alm_calls;
         let prev_dlv = dlv_calls;
-        let mut rd_fired = false;
+        let mut _rd_fired = false;
 
         if cfg.is_arb_strategy {
             // ── ARB-ONLY MODE ──
@@ -399,13 +398,13 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             dispatch_alm(cfg, &mut vault, &mut pool, ext_sqrt, curr_ms, &mut alm_calls, tick_count);
 
             // Regulate debt (runs LAST in arb mode)
-            rd_fired = dispatch_regulate_debt(cfg, &mut vault, &mut pool, target_cr_wad, &mut regulate_debt_calls);
+            _rd_fired = dispatch_regulate_debt(cfg, &mut vault, &mut pool, target_cr_wad, &mut regulate_debt_calls);
         } else {
             // ── EVENT-REPLAY MODE ──
             // Dispatch order: REGULATE_DEBT → DLV → ALM → (replay events)
 
             // Regulate debt (runs FIRST in event-replay mode)
-            rd_fired = dispatch_regulate_debt(cfg, &mut vault, &mut pool, target_cr_wad, &mut regulate_debt_calls);
+            _rd_fired = dispatch_regulate_debt(cfg, &mut vault, &mut pool, target_cr_wad, &mut regulate_debt_calls);
 
             // DLV
             dispatch_dlv(cfg, &mut vault, &mut pool, target_cr_wad, w_const, curr_ms, &mut dlv_calls);
@@ -437,20 +436,19 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             }
         }
 
-        // Detect which events fired this tick
+        // Detect which events fired this tick (RD does NOT contribute to sparse sampling —
+        // TS only calls registerLogSummary for ALM, DLV, SNAPSHOT, and circuit breakers)
         let alm_fired = alm_calls > prev_alm;
         let dlv_fired = dlv_calls > prev_dlv;
-        let event_fired = alm_fired || dlv_fired || rd_fired;
+        let event_fired = alm_fired || dlv_fired;
 
-        // TS only registers log entries at: ALM/DLV/non-noop-RD events, or idle snapshots every 60 min.
-        // Metrics (APY, risk, minCR, drawdown, monthly) are computed from these sparse entries.
-        let should_register = event_fired || (curr_ms - last_idle_snapshot_ms >= idle_snapshot_interval_ms);
-        if should_register && !event_fired {
+        // TS fires SNAPSHOT independently of ALM/DLV — both can log on same tick.
+        // Idle snapshot fires when interval elapsed (regardless of event).
+        let idle_snapshot_due = curr_ms - last_idle_snapshot_ms >= idle_snapshot_interval_ms;
+        if idle_snapshot_due {
             last_idle_snapshot_ms = curr_ms;
         }
-
-        // Snapshot values — use pool price (None) for output metrics,
-        // matching TS which uses pool.sqrtPriceX96 when no quoter/oracle is active.
+        // Post-dispatch pool state (used for idle snapshots and output row)
         let pool_sqrt = pool.sqrt_price_x96();
         let nav = vault.total_pool_value(&pool, None);
         let value_stable = vault.total_value_in_stable(&pool, None);
@@ -465,8 +463,10 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             nav.lo as f64 / 10f64.powi(cfg.pool_config.stable_decimals() as i32);
         let price_f = vol_price_wad.lo as f64 / 1e18;
 
-        // Only register metrics at the same times as TS (sparse sampling)
-        if should_register && price_f > 0.0 {
+        // TS registers ALM, DLV, and SNAPSHOT entries independently per tick.
+        // On overlap ticks (event + idle), duplicates match TS array length.
+        let register_count = (alm_fired as u8) + (dlv_fired as u8) + (idle_snapshot_due as u8);
+        if register_count > 0 && price_f > 0.0 {
             let btc_value = vault_value_f / price_f;
             if first_apy_value.is_none() {
                 first_apy_value = Some((btc_value, curr_ms as f64));
@@ -474,7 +474,9 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             last_apy_value = Some((btc_value, curr_ms as f64));
 
             if btc_value > 0.0 && btc_value.is_finite() {
-                btc_values_for_risk.push(btc_value);
+                for _ in 0..register_count {
+                    btc_values_for_risk.push(btc_value);
+                }
 
                 if btc_value > peak_btc_value {
                     peak_btc_value = btc_value;
