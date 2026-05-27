@@ -4,7 +4,7 @@ use v3_pool::sqrt_price_math;
 use v3_pool::full_math;
 use v3_pool::types::*;
 
-use crate::config::VaultParams;
+use crate::config::{VaultParams, LevAmmConfig};
 use crate::pool_config::PoolConfig;
 
 const MANAGER: &str = "0xVAULT_MANAGER";
@@ -156,6 +156,23 @@ pub struct Vault {
     pub tick_spacing: i32,
 
     pub total_supply: U256,
+
+    // LevAMM state
+    pub lev_amm_notional: U256,
+    pub lev_amm_collateral: U256,
+    pub lev_amm_insolvent: bool,
+    pub lev_amm_fee_revenue: U256,
+    pending_lev_amm_mode: Option<LevAmmOpMode>,
+    pending_lev_amm_trade: U256,
+    pending_lev_amm_is_init: bool,
+    pending_lev_amm_mint_amount0: U256,
+    pending_lev_amm_mint_amount1: U256,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LevAmmOpMode {
+    Mint,
+    Burn,
 }
 
 impl Vault {
@@ -175,6 +192,15 @@ impl Vault {
             last_debt_rebalance_ms: 0,
             tick_spacing,
             total_supply: U256::ZERO,
+            lev_amm_notional: U256::ZERO,
+            lev_amm_collateral: U256::ZERO,
+            lev_amm_insolvent: false,
+            lev_amm_fee_revenue: U256::ZERO,
+            pending_lev_amm_mode: None,
+            pending_lev_amm_trade: U256::ZERO,
+            pending_lev_amm_is_init: false,
+            pending_lev_amm_mint_amount0: U256::ZERO,
+            pending_lev_amm_mint_amount1: U256::ZERO,
         }
     }
 
@@ -1100,6 +1126,158 @@ impl Vault {
         }
     }
 
+    // ── Slow Recenter ──
+
+    pub fn slow_recenter(&mut self, pool: &mut CorePool, cfg: &crate::config::SlowRecenterConfig) -> i32 {
+        let tick = pool.tick_current();
+        let sqrt_price = pool.sqrt_price_x96();
+        let (t0, t1) = self.total_amounts(pool);
+        let price_wad = Self::pool_price(sqrt_price);
+        let is_vol_t0 = self.pool_config.is_volatile_token0();
+        let (volatile_amt, stable_amt) = if is_vol_t0 { (t0, t1) } else { (t1, t0) };
+        let volatile_val = self.volatile_to_stable_val(volatile_amt, price_wad);
+
+        if volatile_val.is_zero() && stable_amt.is_zero() {
+            return 0;
+        }
+
+        let total_value_f = (stable_amt + volatile_val).lo as f64;
+        let stable_share = stable_amt.lo as f64 / total_value_f;
+        let deviation = (stable_share - 0.5).abs() * 2.0;
+
+        let base_mid = self.base.as_ref().map(|p| (p.tick_lower + p.tick_upper) / 2).unwrap_or(tick);
+        let tick_offset = (tick - base_mid).unsigned_abs() as i32;
+        let tick_offset_spacings = (tick_offset as f64 / self.tick_spacing as f64).round() as i32;
+
+        if deviation < cfg.min_deviation && tick_offset_spacings < 1 {
+            return 0;
+        }
+
+        // Emergency full recenter
+        if deviation >= cfg.emergency_threshold {
+            self.withdraw_all(pool);
+            self.rebalance_from_idle(pool);
+            return tick_offset_spacings;
+        }
+
+        // Compute shift speed
+        let shift_speed = if deviation < cfg.acceleration_threshold {
+            let range = cfg.acceleration_threshold - cfg.min_deviation;
+            let t = if range > 0.0 { (deviation - cfg.min_deviation) / range } else { 0.0 };
+            (t * cfg.max_shift_per_step as f64).ceil().max(1.0) as i32
+        } else {
+            let range = cfg.emergency_threshold - cfg.acceleration_threshold;
+            let t = if range > 0.0 { (deviation - cfg.acceleration_threshold) / range } else { 1.0 };
+            (cfg.max_shift_per_step as f64 * cfg.acceleration_multiplier * (1.0 + t)).ceil() as i32
+        };
+
+        let actual_shift = tick_offset_spacings.min(shift_speed);
+        if actual_shift < 1 { return 0; }
+
+        let shift_direction = if tick > base_mid { 1 } else { -1 };
+        let shift_ticks = actual_shift * self.tick_spacing * shift_direction;
+
+        fn bound_tick(t: i32, max: i32) -> i32 { t.max(-max).min(max) }
+        let max_tick = MAX_TICK;
+
+        // Shift each range (wide=0, base=1, limit=2)
+        for pos_idx in 0..3 {
+            let (lo, hi, liq) = match pos_idx {
+                0 => match &self.wide { Some(p) if !p.liquidity.is_zero() => (p.tick_lower, p.tick_upper, p.liquidity), _ => continue },
+                1 => match &self.base { Some(p) if !p.liquidity.is_zero() => (p.tick_lower, p.tick_upper, p.liquidity), _ => continue },
+                2 => match &self.limit { Some(p) if !p.liquidity.is_zero() => (p.tick_lower, p.tick_upper, p.liquidity), _ => continue },
+                _ => unreachable!(),
+            };
+
+            if cfg.only_shift_oor {
+                let in_range = tick >= lo && tick < hi;
+                if in_range { continue; }
+            }
+
+            let new_lo = bound_tick(lo + shift_ticks, max_tick);
+            let new_hi = bound_tick(hi + shift_ticks, max_tick);
+            if new_lo == lo && new_hi == hi { continue; }
+
+            let (burned0, burned1) = pool.burn(MANAGER, lo, hi, I256(liq));
+            let (c0, c1) = pool.collect(MANAGER, lo, hi, MAX_UINT128, MAX_UINT128);
+
+            let fees0 = c0 - burned0.abs();
+            let fees1 = c1 - burned1.abs();
+            self.accumulated_fees0 = self.accumulated_fees0 + fees0;
+            self.accumulated_fees1 = self.accumulated_fees1 + fees1;
+            self.idle0 = self.idle0 + c0;
+            self.idle1 = self.idle1 + c1;
+            self.compensate_burn_rounding(tick, lo, hi, burned0, burned1);
+
+            match pos_idx {
+                0 => if let Some(p) = &mut self.wide { p.tick_lower = new_lo; p.tick_upper = new_hi; p.liquidity = U256::ZERO; },
+                1 => if let Some(p) = &mut self.base { p.tick_lower = new_lo; p.tick_upper = new_hi; p.liquidity = U256::ZERO; },
+                2 => if let Some(p) = &mut self.limit { p.tick_lower = new_lo; p.tick_upper = new_hi; p.liquidity = U256::ZERO; },
+                _ => {}
+            }
+        }
+
+        // Redeploy limit at current tick if configured
+        if cfg.redeploy_limit_at_current_tick {
+            let ts = self.tick_spacing;
+            let tick_floor = tick.div_euclid(ts) * ts;
+            let tick_ceil = tick_floor + ts;
+            let bid_lo = bound_tick(tick_floor - self.params.limit_threshold, max_tick);
+            let bid_hi = bound_tick(tick_floor, max_tick);
+            let ask_lo = bound_tick(tick_ceil, max_tick);
+            let ask_hi = bound_tick(tick_ceil + self.params.limit_threshold, max_tick);
+
+            let new_limit_lo;
+            let new_limit_hi;
+            let bid_ok = bid_hi > bid_lo;
+            let ask_ok = ask_hi > ask_lo;
+            if bid_ok || ask_ok {
+                let bid_liq = if bid_ok {
+                    max_liquidity_for_amounts(sqrt_price, bid_lo, bid_hi, self.idle0, self.idle1)
+                } else { U256::ZERO };
+                let ask_liq = if ask_ok {
+                    max_liquidity_for_amounts(sqrt_price, ask_lo, ask_hi, self.idle0, self.idle1)
+                } else { U256::ZERO };
+                let pick_ask = ask_ok && (!bid_ok || ask_liq > bid_liq);
+                if pick_ask {
+                    new_limit_lo = ask_lo;
+                    new_limit_hi = ask_hi;
+                } else {
+                    new_limit_lo = bid_lo;
+                    new_limit_hi = bid_hi;
+                }
+
+                let cur_lo = self.limit.as_ref().map(|p| p.tick_lower).unwrap_or(0);
+                let cur_hi = self.limit.as_ref().map(|p| p.tick_upper).unwrap_or(0);
+                if new_limit_lo != cur_lo || new_limit_hi != cur_hi {
+                    let lim_liq = self.limit.as_ref().map(|p| p.liquidity).unwrap_or(U256::ZERO);
+                    let lim_lo = self.limit.as_ref().map(|p| p.tick_lower).unwrap_or(0);
+                    let lim_hi = self.limit.as_ref().map(|p| p.tick_upper).unwrap_or(0);
+                    if !lim_liq.is_zero() {
+                        let (b0, b1) = pool.burn(MANAGER, lim_lo, lim_hi, I256(lim_liq));
+                        let (c0, c1) = pool.collect(MANAGER, lim_lo, lim_hi, MAX_UINT128, MAX_UINT128);
+                        let fees0 = c0 - b0.abs();
+                        let fees1 = c1 - b1.abs();
+                        self.accumulated_fees0 = self.accumulated_fees0 + fees0;
+                        self.accumulated_fees1 = self.accumulated_fees1 + fees1;
+                        self.idle0 = self.idle0 + c0;
+                        self.idle1 = self.idle1 + c1;
+                        self.compensate_burn_rounding(tick, lim_lo, lim_hi, b0, b1);
+                    }
+                    if let Some(ref mut lim) = self.limit {
+                        lim.tick_lower = new_limit_lo;
+                        lim.tick_upper = new_limit_hi;
+                        lim.liquidity = U256::ZERO;
+                    }
+                }
+            }
+        }
+
+        // Redeploy idle at new (shifted) boundaries
+        self.deploy_idle_to_lp(pool);
+        actual_shift
+    }
+
     fn value_in_stable(&self, amt0: U256, amt1: U256, price_wad: U256) -> U256 {
         let w = wad();
         let (volatile, stable) = if self.pool_config.is_volatile_token0() {
@@ -1251,6 +1429,21 @@ impl Vault {
         }
     }
 
+    // ── Dynamic thresholds (match TS setDynamicThresholds) ──
+
+    pub fn set_dynamic_thresholds(&mut self, annualized_vol: f64) {
+        let reference_vol = 0.30_f64;
+        let reference_base: f64 = 4800.0;
+        let reference_limit: f64 = 1000.0;
+        let vol_ratio = annualized_vol / reference_vol;
+        let clamped = vol_ratio.clamp(0.5, 3.0);
+        let ts = self.tick_spacing as f64;
+        let new_base = (reference_base * clamped / ts).round() * ts;
+        let new_limit = (reference_limit * clamped / ts).round() * ts;
+        self.params.base_threshold = (new_base as i32).max(self.tick_spacing * 2);
+        self.params.limit_threshold = (new_limit as i32).max(self.tick_spacing);
+    }
+
     // ── collectFees ──
 
     pub fn collect_fees(&mut self, pool: &mut CorePool) {
@@ -1348,6 +1541,16 @@ impl Vault {
         }
 
         (total0, total1)
+    }
+
+    pub fn wide_info(&self) -> (i32, i32, U256) {
+        self.wide.as_ref().map(|p| (p.tick_lower, p.tick_upper, p.liquidity)).unwrap_or((0, 0, U256::ZERO))
+    }
+    pub fn base_info(&self) -> (i32, i32, U256) {
+        self.base.as_ref().map(|p| (p.tick_lower, p.tick_upper, p.liquidity)).unwrap_or((0, 0, U256::ZERO))
+    }
+    pub fn limit_info(&self) -> (i32, i32, U256) {
+        self.limit.as_ref().map(|p| (p.tick_lower, p.tick_upper, p.liquidity)).unwrap_or((0, 0, U256::ZERO))
     }
 
     pub fn total_amounts(&self, pool: &CorePool) -> (U256, U256) {
@@ -1504,4 +1707,394 @@ impl Vault {
         let cr_wad = self.collateral_ratio_wad(pool, override_sqrt);
         cr_wad.lo as f64 / 1e18 * 100.0
     }
+
+    // ── LevAMM ──
+
+    fn sqrt_bigint(value: U256) -> U256 {
+        if value < U256::from_u128(2) { return value; }
+        let mut current = value;
+        let mut next = (current + U256::ONE) >> 1;
+        while next < current {
+            current = next;
+            next = (next + value / next) >> 1;
+        }
+        current
+    }
+
+    fn lev_amm_curve_ratio_wad(tc: U256) -> U256 {
+        let w = wad();
+        let denom = tc + w;
+        full_math::mul_div(tc * tc, w, denom * denom)
+    }
+
+    fn lev_amm_curve_x0(coll_value: U256, debt: U256, curve_ratio_wad: U256) -> U256 {
+        let w = wad();
+        let scaled_coll = w * coll_value;
+        let disc = scaled_coll * scaled_coll - U256::from_u128(4) * curve_ratio_wad * w * coll_value * debt;
+        (scaled_coll + Self::sqrt_bigint(disc)) / (U256::from_u128(2) * curve_ratio_wad)
+    }
+
+    fn lev_amm_debt_for_collateral(curve_ratio_wad: U256, x0: U256, coll_value: U256) -> U256 {
+        if curve_ratio_wad.is_zero() || x0.is_zero() || coll_value.is_zero() { return U256::ZERO; }
+        let w = wad();
+        let offset = full_math::mul_div(curve_ratio_wad, x0 * x0, w * coll_value);
+        if x0 > offset { x0 - offset } else { U256::ZERO }
+    }
+
+    fn lev_amm_collateral_for_debt(curve_ratio_wad: U256, x0: U256, debt: U256) -> U256 {
+        if curve_ratio_wad.is_zero() || x0 <= debt { return U256::ZERO; }
+        let w = wad();
+        ceil_div(curve_ratio_wad * x0 * x0, w * (x0 - debt))
+    }
+
+    fn lev_amm_collateral_for_price(curve_ratio_wad: U256, x0: U256, price_wad: U256, round_up: bool) -> U256 {
+        if curve_ratio_wad.is_zero() || x0.is_zero() || price_wad.is_zero() { return U256::ZERO; }
+        let squared = full_math::mul_div(curve_ratio_wad, x0 * x0, price_wad);
+        let mut root = Self::sqrt_bigint(squared);
+        if round_up && root * root < squared { root = root + U256::ONE; }
+        root
+    }
+
+    fn lev_amm_stable_split(lp_stable_value: U256, stable_balance: U256, total_at_oracle: U256) -> (U256, U256) {
+        if lp_stable_value.is_zero() || total_at_oracle.is_zero() {
+            return (U256::ZERO, U256::ZERO);
+        }
+        let stable_part = if stable_balance.is_zero() {
+            U256::ZERO
+        } else {
+            full_math::mul_div(lp_stable_value, stable_balance, total_at_oracle)
+        };
+        let vol_part = if lp_stable_value > stable_part { lp_stable_value - stable_part } else { U256::ZERO };
+        (stable_part, vol_part)
+    }
+
+    fn lev_amm_lp_acquire_cost_wad(stable_balance: U256, total_at_oracle: U256, fee_num: U256) -> U256 {
+        let w = wad();
+        let fee_den = U256::from_u128(1_000_000);
+        if total_at_oracle.is_zero() { return U256::ZERO; }
+        let stable_share_wad = if stable_balance.is_zero() { U256::ZERO } else { full_math::mul_div(stable_balance, w, total_at_oracle) };
+        let volatile_share_wad = if stable_share_wad < w { w - stable_share_wad } else { U256::ZERO };
+        let one_minus_fee = fee_den - fee_num;
+        stable_share_wad + full_math::mul_div_rounding_up(volatile_share_wad, fee_den, one_minus_fee)
+    }
+
+    fn lev_amm_lp_unwind_proceeds_wad(stable_balance: U256, total_at_oracle: U256, fee_num: U256) -> U256 {
+        let w = wad();
+        let fee_den = U256::from_u128(1_000_000);
+        if total_at_oracle.is_zero() { return U256::ZERO; }
+        let stable_share_wad = if stable_balance.is_zero() { U256::ZERO } else { full_math::mul_div(stable_balance, w, total_at_oracle) };
+        let volatile_share_wad = if stable_share_wad < w { w - stable_share_wad } else { U256::ZERO };
+        let one_minus_fee = fee_den - fee_num;
+        stable_share_wad + full_math::mul_div(volatile_share_wad, one_minus_fee, fee_den)
+    }
+
+    fn lev_amm_lp_acquire_cost(lp_stable_value: U256, stable_balance: U256, total_at_oracle: U256, fee_num: U256) -> U256 {
+        let fee_den = U256::from_u128(1_000_000);
+        let (stable_part, volatile_stable_part) = Self::lev_amm_stable_split(lp_stable_value, stable_balance, total_at_oracle);
+        let one_minus_fee = fee_den - fee_num;
+        stable_part + full_math::mul_div_rounding_up(volatile_stable_part, fee_den, one_minus_fee)
+    }
+
+    fn lev_amm_lp_unwind_proceeds(lp_stable_value: U256, stable_balance: U256, total_at_oracle: U256, fee_num: U256) -> U256 {
+        let fee_den = U256::from_u128(1_000_000);
+        let (stable_part, volatile_stable_part) = Self::lev_amm_stable_split(lp_stable_value, stable_balance, total_at_oracle);
+        stable_part + full_math::mul_div(volatile_stable_part, fee_den - fee_num, fee_den)
+    }
+
+    pub fn run_lev_amm_step(&mut self, pool: &mut CorePool, lev_amm_cfg: &LevAmmConfig, target_cr_wad: U256) -> U256 {
+        let price_wad = Self::pool_price(pool.sqrt_price_x96());
+        let (t0, t1) = self.total_amounts(pool);
+        let result = self.lev_amm_step_sync(t0, t1, price_wad, lev_amm_cfg, target_cr_wad);
+        self.apply_pending_lev_amm_op(pool, price_wad);
+        result.fee
+    }
+
+    fn lev_amm_step_sync(
+        &mut self,
+        total0: U256,
+        total1: U256,
+        price_wad: U256,
+        lev_amm_cfg: &LevAmmConfig,
+        target_cr_wad: U256,
+    ) -> LevAmmResult {
+        let noop = LevAmmResult { fee: U256::ZERO };
+        assert!(self.pending_lev_amm_mode.is_none(), "LevAMM: prior pending op leaked");
+        let w = wad();
+        let fee_den = U256::from_u128(1_000_000);
+
+        let lp_value = self.value_in_stable(total0, total1, price_wad);
+        if lp_value.is_zero() { return noop; }
+        if target_cr_wad <= w { return noop; }
+        let tc_minus_wad = target_cr_wad - w;
+        let is_vol_t0 = self.pool_config.is_volatile_token0();
+
+        // ---- INIT ----
+        if self.lev_amm_notional.is_zero() {
+            let volatile_amt = if is_vol_t0 { total0 } else { total1 };
+            let volatile_value_stable = self.volatile_to_stable_val(volatile_amt, price_wad);
+            let initial_mint = full_math::mul_div(volatile_value_stable, tc_minus_wad, w);
+            if initial_mint.is_zero() { return noop; }
+            self.virtual_debt = self.virtual_debt + initial_mint;
+            if is_vol_t0 {
+                self.idle1 = self.idle1 + initial_mint;
+            } else {
+                self.idle0 = self.idle0 + initial_mint;
+            }
+            let post_mint_gav = lp_value + initial_mint;
+            self.lev_amm_notional = post_mint_gav;
+            self.lev_amm_collateral = post_mint_gav;
+            self.pending_lev_amm_mode = Some(LevAmmOpMode::Mint);
+            self.pending_lev_amm_trade = initial_mint;
+            self.pending_lev_amm_is_init = true;
+            return LevAmmResult { fee: U256::ZERO };
+        }
+
+        // ---- STEADY STATE ----
+        let p_lp = full_math::mul_div(lp_value, w, self.lev_amm_notional);
+        let lp_collateral = self.lev_amm_collateral;
+        if lp_collateral.is_zero() || p_lp.is_zero() { return noop; }
+        let coll_value = full_math::mul_div(p_lp, lp_collateral, w);
+        if coll_value.is_zero() { return noop; }
+
+        let d = self.virtual_debt;
+        let v = if is_vol_t0 { total0 } else { total1 };
+        let s = if is_vol_t0 { total1 } else { total0 };
+        let v_stable = self.volatile_to_stable_val(v, price_wad);
+        let total_at_oracle = v_stable + s;
+        if total_at_oracle.is_zero() { return noop; }
+
+        let effective_tc = target_cr_wad;
+        let target_debt = full_math::mul_div(coll_value, w, effective_tc);
+        let curve_ratio_wad = Self::lev_amm_curve_ratio_wad(effective_tc);
+        if curve_ratio_wad.is_zero() { return noop; }
+
+        let insolvency_threshold = full_math::mul_div(coll_value, w, U256::from_u128(4) * curve_ratio_wad);
+        let min_safe_debt = target_debt / U256::from_u128(8);
+        let max_safe_debt = if insolvency_threshold > coll_value / U256::from_u128(32) {
+            insolvency_threshold - coll_value / U256::from_u128(32)
+        } else {
+            insolvency_threshold
+        };
+
+        if d > insolvency_threshold && d < target_debt {
+            if !self.lev_amm_insolvent {
+                self.lev_amm_insolvent = true;
+                eprintln!("[LEV-AMM] INSOLVENT (mint blocked, burn allowed)");
+            }
+            return noop;
+        }
+        if self.lev_amm_insolvent && d <= insolvency_threshold {
+            self.lev_amm_insolvent = false;
+            eprintln!("[LEV-AMM] solvent again");
+        }
+
+        let fee_num = U256::from_u128((lev_amm_cfg.swap_fee * 1_000_000.0).max(0.0).floor() as u128);
+        let one_minus_fee = fee_den - fee_num;
+        if one_minus_fee.is_zero() { return noop; }
+
+        let curve_debt_input = if d > insolvency_threshold { insolvency_threshold } else { d };
+        let x0 = Self::lev_amm_curve_x0(coll_value, curve_debt_input, curve_ratio_wad);
+        if x0.is_zero() { return noop; }
+
+        let lp_acquire_cost_wad = Self::lev_amm_lp_acquire_cost_wad(s, total_at_oracle, fee_num);
+        let lp_unwind_proceeds_wad = Self::lev_amm_lp_unwind_proceeds_wad(s, total_at_oracle, fee_num);
+        let amm_sell_threshold_wad = full_math::mul_div_rounding_up(lp_acquire_cost_wad, fee_den, one_minus_fee);
+        let amm_buy_threshold_wad = full_math::mul_div(lp_unwind_proceeds_wad, fee_den, fee_den + fee_num);
+
+        // ---- MINT (add debt) ----
+        if d < max_safe_debt {
+            let mut target_coll_value = Self::lev_amm_collateral_for_price(curve_ratio_wad, x0, amm_sell_threshold_wad, true);
+            let max_safe_coll_value = Self::lev_amm_collateral_for_debt(curve_ratio_wad, x0, max_safe_debt);
+            if !max_safe_coll_value.is_zero() && (target_coll_value.is_zero() || target_coll_value > max_safe_coll_value) {
+                target_coll_value = max_safe_coll_value;
+            }
+            if target_coll_value <= coll_value { return noop; }
+
+            let desired_trade = target_coll_value - coll_value;
+            let mut trade = desired_trade;
+            let max_frac = lev_amm_cfg.max_arb_per_tick_frac.max(0.0).min(1.0);
+            if max_frac < 1.0 {
+                let max_arb = (coll_value * U256::from_u128((max_frac * 1_000_000.0) as u128)) / U256::from_u128(1_000_000);
+                if trade > max_arb { trade = max_arb; }
+            }
+            if trade.is_zero() { return noop; }
+
+            let final_coll_value = coll_value + trade;
+            let mut debt_target = Self::lev_amm_debt_for_collateral(curve_ratio_wad, x0, final_coll_value);
+            if debt_target <= d { return noop; }
+
+            let mut principal = debt_target - d;
+            // principal cap not set (env LEVAMM_PRINCIPAL_CAP_BPS defaults to 0)
+            let fee = full_math::mul_div(principal, fee_num, fee_den);
+            let arb_cost = Self::lev_amm_lp_acquire_cost(trade, s, total_at_oracle, fee_num);
+            let arb_net = if principal > fee { principal - fee } else { U256::ZERO };
+            if arb_net <= arb_cost { return noop; }
+
+            self.virtual_debt = debt_target;
+            let (stable_part, volatile_stable_part) = Self::lev_amm_stable_split(trade, s, total_at_oracle);
+            let add_volatile = self.stable_to_volatile_val(volatile_stable_part, price_wad);
+            if is_vol_t0 {
+                self.pending_lev_amm_mint_amount0 = add_volatile;
+                self.pending_lev_amm_mint_amount1 = stable_part;
+            } else {
+                self.pending_lev_amm_mint_amount1 = add_volatile;
+                self.pending_lev_amm_mint_amount0 = stable_part;
+            }
+            if !fee.is_zero() {
+                if is_vol_t0 { self.idle1 = self.idle1 + fee; }
+                else { self.idle0 = self.idle0 + fee; }
+                self.lev_amm_fee_revenue = self.lev_amm_fee_revenue + fee;
+            }
+            self.pending_lev_amm_mode = Some(LevAmmOpMode::Mint);
+            self.pending_lev_amm_trade = trade;
+            return LevAmmResult { fee };
+        }
+
+        // ---- BURN (reduce debt) ----
+        if d > min_safe_debt {
+            let mut target_coll_value = Self::lev_amm_collateral_for_price(curve_ratio_wad, x0, amm_buy_threshold_wad, false);
+            let min_safe_coll_value = Self::lev_amm_collateral_for_debt(curve_ratio_wad, x0, min_safe_debt);
+            if !min_safe_coll_value.is_zero() && (target_coll_value.is_zero() || target_coll_value < min_safe_coll_value) {
+                target_coll_value = min_safe_coll_value;
+            }
+            if target_coll_value >= coll_value || target_coll_value.is_zero() { return noop; }
+
+            let desired_trade = coll_value - target_coll_value;
+            let mut trade = desired_trade;
+            let max_frac = lev_amm_cfg.max_arb_per_tick_frac.max(0.0).min(1.0);
+            if max_frac < 1.0 {
+                let max_arb = (coll_value * U256::from_u128((max_frac * 1_000_000.0) as u128)) / U256::from_u128(1_000_000);
+                if trade > max_arb { trade = max_arb; }
+            }
+            if trade.is_zero() { return noop; }
+
+            let final_coll_value = coll_value - trade;
+            let mut debt_target = Self::lev_amm_debt_for_collateral(curve_ratio_wad, x0, final_coll_value);
+            if debt_target < min_safe_debt { debt_target = min_safe_debt; }
+            if debt_target >= d { return noop; }
+
+            let principal = d - debt_target;
+            // burn principal cap not set (env LEVAMM_BURN_PRINCIPAL_CAP_BPS defaults to 0)
+            let fee = full_math::mul_div(principal, fee_num, fee_den);
+            let arb_proceeds = Self::lev_amm_lp_unwind_proceeds(trade, s, total_at_oracle, fee_num);
+            let arb_cost = principal + fee;
+            if arb_proceeds <= arb_cost { return noop; }
+
+            self.virtual_debt = debt_target;
+            if !fee.is_zero() {
+                if is_vol_t0 { self.idle1 = self.idle1 + fee; }
+                else { self.idle0 = self.idle0 + fee; }
+                self.lev_amm_fee_revenue = self.lev_amm_fee_revenue + fee;
+            }
+            self.pending_lev_amm_mode = Some(LevAmmOpMode::Burn);
+            self.pending_lev_amm_trade = trade;
+            return LevAmmResult { fee };
+        }
+
+        noop
+    }
+
+    fn apply_pending_lev_amm_op(&mut self, pool: &mut CorePool, price_wad: U256) {
+        let mode = self.pending_lev_amm_mode.take();
+        let trade = self.pending_lev_amm_trade;
+        let is_init = self.pending_lev_amm_is_init;
+        let mint_amt0 = self.pending_lev_amm_mint_amount0;
+        let mint_amt1 = self.pending_lev_amm_mint_amount1;
+        self.pending_lev_amm_trade = U256::ZERO;
+        self.pending_lev_amm_is_init = false;
+        self.pending_lev_amm_mint_amount0 = U256::ZERO;
+        self.pending_lev_amm_mint_amount1 = U256::ZERO;
+
+        let mode = match mode {
+            Some(m) => m,
+            None => return,
+        };
+
+        if mode == LevAmmOpMode::Mint {
+            if is_init {
+                if !mint_amt0.is_zero() || !mint_amt1.is_zero() {
+                    self.idle0 = self.idle0 + mint_amt0;
+                    self.idle1 = self.idle1 + mint_amt1;
+                }
+                self.withdraw_all(pool);
+                self.rebalance_from_idle(pool);
+                return;
+            }
+            self.lev_amm_mint_direct_to_lp(pool, mint_amt0, mint_amt1);
+            return;
+        }
+
+        // mode == Burn
+        if trade.is_zero() { return; }
+        let idle0_before = self.idle0;
+        let idle1_before = self.idle1;
+        let m_fees0_before = U256::ZERO; // no manager fees in sim
+        let m_fees1_before = U256::ZERO;
+        let s_fees0_before = self.accumulated_fees0;
+        let s_fees1_before = self.accumulated_fees1;
+
+        let (actual0, actual1) = self.partial_deleverage(pool, trade, price_wad);
+
+        let reserved_fees0 = (self.accumulated_fees0 - s_fees0_before);
+        let reserved_fees1 = (self.accumulated_fees1 - s_fees1_before);
+        let strip0 = if actual0 > reserved_fees0 { actual0 - reserved_fees0 } else { U256::ZERO };
+        let strip1 = if actual1 > reserved_fees1 { actual1 - reserved_fees1 } else { U256::ZERO };
+        let idle_delta0 = if self.idle0 > idle0_before { self.idle0 - idle0_before } else { U256::ZERO };
+        let idle_delta1 = if self.idle1 > idle1_before { self.idle1 - idle1_before } else { U256::ZERO };
+        let drop0 = strip0.min(idle_delta0);
+        let drop1 = strip1.min(idle_delta1);
+        if !drop0.is_zero() { self.idle0 = self.idle0 - drop0; }
+        if !drop1.is_zero() { self.idle1 = self.idle1 - drop1; }
+    }
+
+    fn lev_amm_mint_direct_to_lp(&mut self, pool: &mut CorePool, amount0: U256, amount1: U256) {
+        if amount0.is_zero() && amount1.is_zero() { return; }
+
+        // Stage into idle (match TS: amounts enter idle, then mint subtracts used)
+        self.idle0 = self.idle0 + amount0;
+        self.idle1 = self.idle1 + amount1;
+
+        let sqrt_price = pool.sqrt_price_x96();
+        let wide_liq = self.wide.as_ref().map(|p| p.liquidity).unwrap_or(U256::ZERO);
+        let base_liq = self.base.as_ref().map(|p| p.liquidity).unwrap_or(U256::ZERO);
+        let total_liq = wide_liq + base_liq;
+        if total_liq.is_zero() {
+            // No in-range positions — leave in idle for next deploy cycle
+            return;
+        }
+
+        let frac_den = U256::from_u128(1_000_000);
+
+        for pos_idx in [0, 1] {
+            let (tick_lower, tick_upper, existing_liq) = match pos_idx {
+                0 => match &self.wide { Some(p) => (p.tick_lower, p.tick_upper, p.liquidity), None => continue },
+                1 => match &self.base { Some(p) => (p.tick_lower, p.tick_upper, p.liquidity), None => continue },
+                _ => unreachable!(),
+            };
+            if existing_liq.is_zero() { continue; }
+            let frac = full_math::mul_div(existing_liq, frac_den, total_liq);
+            let frac_a0 = full_math::mul_div(amount0, frac, frac_den);
+            let frac_a1 = full_math::mul_div(amount1, frac, frac_den);
+            if frac_a0.is_zero() && frac_a1.is_zero() { continue; }
+
+            let liq = max_liquidity_for_amounts(sqrt_price, tick_lower, tick_upper, frac_a0, frac_a1);
+            let capped = cap_liquidity(sqrt_price, tick_lower, tick_upper, liq, self.idle0, self.idle1);
+            if capped.is_zero() { continue; }
+
+            let (a0, a1) = pool.mint(MANAGER, tick_lower, tick_upper, I256(capped));
+            let used0 = a0.abs();
+            let used1 = a1.abs();
+            self.idle0 = if self.idle0 > used0 { self.idle0 - used0 } else { U256::ZERO };
+            self.idle1 = if self.idle1 > used1 { self.idle1 - used1 } else { U256::ZERO };
+            match pos_idx {
+                0 => if let Some(p) = &mut self.wide { p.liquidity = p.liquidity + capped; },
+                1 => if let Some(p) = &mut self.base { p.liquidity = p.liquidity + capped; },
+                _ => {}
+            }
+        }
+    }
+}
+
+struct LevAmmResult {
+    fee: U256,
 }

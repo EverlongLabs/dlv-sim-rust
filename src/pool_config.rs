@@ -80,7 +80,7 @@ pub fn cbbtc_usdc_base() -> PoolConfig {
         },
         volatile_token: TokenRole::Token1,
         stable_token: TokenRole::Token0,
-        db_path: "data/cbBTC-USDC-BASE_0xeC558e484cC9f2210714E345298fdc53B253c27D.db".into(),
+        db_path: "../dlv-sim/data/cbBTC-USDC-BASE_0xeC558e484cC9f2210714E345298fdc53B253c27D.db".into(),
         display_name: "cbBTC-USDC Base 0.3%".into(),
     }
 }
@@ -104,8 +104,32 @@ pub fn wbtc_usdc() -> PoolConfig {
         },
         volatile_token: TokenRole::Token0,
         stable_token: TokenRole::Token1,
-        db_path: "data/WBTC-USDC_0x99ac8cA7087fA4A2A1FB6357269965A2014ABc35.db".into(),
+        db_path: "../dlv-sim/data/WBTC-USDC_0x99ac8cA7087fA4A2A1FB6357269965A2014ABc35.db".into(),
         display_name: "WBTC-USDC 0.3%".into(),
+    }
+}
+
+pub fn wbtc_usdc_katana_5bp() -> PoolConfig {
+    PoolConfig {
+        pool_address: "0x744676b3ced942d78f9b8e9cd22246db5c32395c".into(),
+        fee_amount: 500,
+        chain: "katana".into(),
+        token0: TokenConfig {
+            symbol: "WBTC".into(),
+            name: "Wrapped Bitcoin".into(),
+            decimals: 8,
+            address: "0x0913DA6Da4b42f538B445599b46Bb4622342Cf52".into(),
+        },
+        token1: TokenConfig {
+            symbol: "vbUSDC".into(),
+            name: "vbUSDC".into(),
+            decimals: 6,
+            address: "0x203a662b0bd271a6ed5a60edfbd04bfce608fd36".into(),
+        },
+        volatile_token: TokenRole::Token0,
+        stable_token: TokenRole::Token1,
+        db_path: "../dlv-sim/data/WBTC-USDC-KATANA-5BP_0x744676b3ced942d78f9b8e9cd22246db5c32395c.db".into(),
+        display_name: "WBTC-vbUSDC Katana 0.05%".into(),
     }
 }
 
@@ -113,6 +137,7 @@ pub fn pool_by_name(name: &str) -> PoolConfig {
     match name.to_uppercase().as_str() {
         "CBBTC_USDC_BASE" => cbbtc_usdc_base(),
         "WBTC_USDC" => wbtc_usdc(),
+        "WBTC_USDC_KATANA_5BP" => wbtc_usdc_katana_5bp(),
         _ => cbbtc_usdc_base(),
     }
 }

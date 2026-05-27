@@ -8,7 +8,7 @@ use v3_pool::position_manager::PositionManager;
 use v3_pool::types::*;
 
 use crate::arb;
-use crate::config::Config;
+use crate::config::{Config, ActiveRebalanceMode};
 use crate::enums::EventType;
 use crate::event_reader::{self, EventReader, PoolEvent};
 use crate::output::{JsonlWriter, RebalanceLogRow};
@@ -131,7 +131,18 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
         );
     }
 
-    let (_pool_id, fee, tick_spacing) = event_reader.get_pool_config();
+    let (_pool_id, base_fee, base_tick_spacing) = event_reader.get_pool_config();
+    let (fee, tick_spacing) = if let Some(override_fee) = cfg.pool_fee_override {
+        let ts = match override_fee {
+            100 => 1,
+            500 => 10,
+            3000 => 60,
+            _ => 200,
+        };
+        (override_fee, ts)
+    } else {
+        (base_fee, base_tick_spacing)
+    };
     let initial_sqrt = event_reader.get_initial_sqrt_price_x96();
 
     let mut pool = CorePool::new(
@@ -259,7 +270,11 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
 
     let volatile_u256 = U256::from_u128(volatile_raw);
     let vol_price_wad = Vault::volatile_price_wad(pool.sqrt_price_x96(), cfg.pool_config.is_volatile_token0());
-    let stable_u256 = full_math::mul_div_rounding_up(volatile_u256, vol_price_wad, wad());
+    let stable_u256 = if cfg.lev_amm.enabled {
+        U256::ZERO
+    } else {
+        full_math::mul_div_rounding_up(volatile_u256, vol_price_wad, wad())
+    };
     let stable_raw = stable_u256.lo as u128;
     let (a0, a1) = if cfg.pool_config.is_volatile_token0() {
         (volatile_u256, stable_u256)
@@ -278,8 +293,10 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
     );
 
     // Initialize debt (matching TS initializeAccountVault → rebalanceDebt)
+    // When LevAMM is enabled, TS skips rebalanceDebt during init (returns ZERO)
+    // because LevAMM manages debt from its own init step on the first tick.
     let target_cr_wad = U256::from_u128(cfg.target_cr_wad());
-    if !cfg.is_alm_only && cfg.is_regulate_debt {
+    if !cfg.is_alm_only && cfg.is_regulate_debt && !cfg.lev_amm.enabled {
         vault.rebalance_debt(&mut pool, target_cr_wad, cfg.dlv.debt_to_volatile_swap_fee);
         let (t0, t1) = vault.total_amounts(&pool);
         let init_gav = vault.total_value_in_stable(&pool, None);
@@ -320,6 +337,9 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
     let mut dlv_calls: u64 = 0;
     let mut regulate_debt_calls: u64 = 0;
     let mut arb_calls: u64 = 0;
+    let mut lev_amm_calls: u64 = 0;
+    let mut slow_recenter_calls: u64 = 0;
+    let mut last_slow_recenter_ms: i64 = 0;
     let w_const = U256::from_u128(1_000_000_000_000_000_000);
 
     // APY + risk metrics tracking (pool price, matching TS with no quoter/oracle)
@@ -334,6 +354,15 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
     // Idle snapshot interval: TS logs every 60 min when no event fires
     let idle_snapshot_interval_ms: i64 = 3600 * 1000;
     let mut last_idle_snapshot_ms: i64 = 0;
+
+    // Log-return circular buffer for dynamic thresholds (match TS LogReturnsWindow)
+    let vol_window_size = ((cfg.volatility_window_minutes as usize) * 60)
+        .checked_div(cfg.lookup_period as usize)
+        .unwrap_or(1)
+        .max(1);
+    let mut log_returns: Vec<f64> = Vec::with_capacity(vol_window_size);
+    let mut log_returns_idx: usize = 0;
+    let mut prev_ext_price: f64 = 0.0;
 
     // Event cursor for event-replay mode
     let mut event_cursor: usize = 0;
@@ -361,6 +390,18 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
         // Get external price (used for APY/risk tracking in both modes)
         let (ext_price, ext_sqrt) = price_feed.get_price_at_monotonic(curr_ms);
 
+        // Update log-return buffer (match TS cache phase AFTER_NEW_TIME_PERIOD)
+        if cfg.use_dynamic_width && ext_price > 0.0 && prev_ext_price > 0.0 {
+            let lr = (ext_price / prev_ext_price).ln();
+            if log_returns.len() < vol_window_size {
+                log_returns.push(lr);
+            } else {
+                log_returns[log_returns_idx] = lr;
+            }
+            log_returns_idx = (log_returns_idx + 1) % vol_window_size;
+        }
+        if ext_price > 0.0 { prev_ext_price = ext_price; }
+
         let mut arb_profit = U256::ZERO;
         let mut arb_dev_bps = 0.0f64;
 
@@ -378,30 +419,63 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
 
         if cfg.is_arb_strategy {
             // ── ARB-ONLY MODE ──
-            // Dispatch order: ARB → DLV → ALM → REGULATE_DEBT
+            // Dispatch order: ARB → LEV_AMM → SLOW_RECENTER → DLV → ALM → REGULATE_DEBT
 
             if ext_price > 0.0 {
                 let detection = arb::detect_arb(pool.sqrt_price_x96(), ext_sqrt, fee);
                 arb_dev_bps = detection.deviation_bps;
+
+                if let Some(diag_limit) = std::env::var("TICK_DIAG").ok().and_then(|v| v.parse::<u64>().ok()) {
+                    if tick_count <= diag_limit {
+                        eprintln!(
+                            "[TICK_DIAG] t={} pool_tick={} pool_sqrt={} ext_sqrt={} ext_price={:.2} fee={} dev_bps={:.1} arb={}",
+                            tick_count, pool.tick_current(), pool.sqrt_price_x96().to_dec_string(),
+                            ext_sqrt.to_dec_string(), ext_price, fee, detection.deviation_bps, detection.is_arbitrable,
+                        );
+                        let (t0, t1) = vault.total_amounts(&pool);
+                        eprintln!(
+                            "[TICK_DIAG]   total0={} total1={} idle0={} idle1={} debt={} liq={} CR={:.2}%",
+                            t0.to_dec_string(), t1.to_dec_string(),
+                            vault.idle0.to_dec_string(), vault.idle1.to_dec_string(),
+                            vault.virtual_debt.to_dec_string(), pool.liquidity().to_dec_string(),
+                            vault.collateral_ratio_pct(&pool, None),
+                        );
+                    }
+                }
+
                 if detection.is_arbitrable {
-                    let current = pool.sqrt_price_x96();
-                    let target = detection.target_sqrt_price_x96;
-                    let valid = if detection.zero_for_one {
-                        target < current && target > MIN_SQRT_RATIO
-                    } else {
-                        target > current && target < MAX_SQRT_RATIO
-                    };
-                    if valid {
-                        let result = arb::execute_arb_close_gap(&mut pool, &detection, cfg.pool_config.is_volatile_token0());
-                        arb_profit = result.profit_stable.abs();
-                        if result.profit_stable.is_positive() && !arb_profit.is_zero() {
-                            if cfg.pool_config.is_volatile_token0() {
-                                vault.idle1 = vault.idle1 + arb_profit;
-                            } else {
-                                vault.idle0 = vault.idle0 + arb_profit;
-                            }
+                    let result = arb::execute_arb_close_gap(&mut pool, &detection, cfg.pool_config.is_volatile_token0());
+                    arb_profit = result.profit_stable.abs();
+                    if result.profit_stable.is_positive() && !arb_profit.is_zero() && !cfg.no_arb_donation {
+                        if cfg.pool_config.is_volatile_token0() {
+                            vault.idle1 = vault.idle1 + arb_profit;
+                        } else {
+                            vault.idle0 = vault.idle0 + arb_profit;
                         }
-                        arb_calls += 1;
+                    }
+                    arb_calls += 1;
+
+                    if cfg.use_fee_recycling {
+                        vault.collect_fees(&mut pool);
+                        vault.deploy_idle_to_lp(&mut pool);
+                    }
+                }
+            }
+
+            // LevAMM
+            if cfg.lev_amm.enabled {
+                vault.run_lev_amm_step(&mut pool, &cfg.lev_amm, target_cr_wad);
+                lev_amm_calls += 1;
+            }
+
+            // Slow Recenter
+            if cfg.slow_recenter.enabled {
+                let sr_elapsed = curr_ms - last_slow_recenter_ms;
+                if last_slow_recenter_ms == 0 || sr_elapsed >= (cfg.slow_recenter.trigger_interval_seconds as i64) * 1000 {
+                    let shifted = vault.slow_recenter(&mut pool, &cfg.slow_recenter);
+                    last_slow_recenter_ms = curr_ms;
+                    if shifted > 0 {
+                        slow_recenter_calls += 1;
                     }
                 }
             }
@@ -417,13 +491,13 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             alm_nav = vault.total_pool_value(&pool, None);
 
             // Regulate debt (runs LAST in arb mode)
-            _rd_fired = dispatch_regulate_debt(cfg, &mut vault, &mut pool, target_cr_wad, &mut regulate_debt_calls);
+            _rd_fired = dispatch_regulate_debt(cfg, &mut vault, &mut pool, target_cr_wad, &mut regulate_debt_calls, &log_returns);
         } else {
             // ── EVENT-REPLAY MODE ──
             // Dispatch order: REGULATE_DEBT → DLV → ALM → (replay events)
 
             // Regulate debt (runs FIRST in event-replay mode)
-            _rd_fired = dispatch_regulate_debt(cfg, &mut vault, &mut pool, target_cr_wad, &mut regulate_debt_calls);
+            _rd_fired = dispatch_regulate_debt(cfg, &mut vault, &mut pool, target_cr_wad, &mut regulate_debt_calls, &log_returns);
 
             // DLV
             dlv_pre_sqrt = pool.sqrt_price_x96();
@@ -482,6 +556,43 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
         if idle_snapshot_due {
             last_idle_snapshot_ms = curr_ms;
         }
+        // Daily checkpoint diagnostic (every 7200 ticks = 1 day at 12s periods)
+        if std::env::var("DAILY_DIAG").is_ok() && tick_count % 7200 == 0 {
+            let day = tick_count / 7200;
+            let (t0, t1) = vault.total_amounts(&pool);
+            let cr = vault.collateral_ratio_pct(&pool, None);
+            let wide_info = vault.wide_info();
+            let base_info = vault.base_info();
+            let limit_info = vault.limit_info();
+            eprintln!(
+                "[DAY_DIAG] day={} t={} pool_tick={} pool_sqrt={} pool_liq={}",
+                day, tick_count, pool.tick_current(), pool.sqrt_price_x96().to_dec_string(),
+                pool.liquidity().to_dec_string(),
+            );
+            eprintln!(
+                "[DAY_DIAG]   total0={} total1={} idle0={} idle1={} debt={} CR={:.2}%",
+                t0.to_dec_string(), t1.to_dec_string(),
+                vault.idle0.to_dec_string(), vault.idle1.to_dec_string(),
+                vault.virtual_debt.to_dec_string(), cr,
+            );
+            eprintln!(
+                "[DAY_DIAG]   notional={} collateral={} fee_rev={}",
+                vault.lev_amm_notional.to_dec_string(),
+                vault.lev_amm_collateral.to_dec_string(),
+                vault.lev_amm_fee_revenue.to_dec_string(),
+            );
+            eprintln!(
+                "[DAY_DIAG]   wide=[{},{},liq={}] base=[{},{},liq={}] limit=[{},{},liq={}]",
+                wide_info.0, wide_info.1, wide_info.2.to_dec_string(),
+                base_info.0, base_info.1, base_info.2.to_dec_string(),
+                limit_info.0, limit_info.1, limit_info.2.to_dec_string(),
+            );
+            eprintln!(
+                "[DAY_DIAG]   arb={} levamm={} sr={} dlv={} rd={}",
+                arb_calls, lev_amm_calls, slow_recenter_calls, dlv_calls, regulate_debt_calls,
+            );
+        }
+
         // Post-dispatch pool state (used for idle snapshots and output row)
         let pool_sqrt = pool.sqrt_price_x96();
         let nav = vault.total_pool_value(&pool, None);
@@ -658,8 +769,8 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
     println!("DLV calls: {}", dlv_calls);
     println!("Regulate Debt calls: {}", regulate_debt_calls);
     println!("Arb calls: {}", arb_calls);
-    println!("LevAMM calls: 0");
-    println!("Slow Recenter calls: 0");
+    println!("LevAMM calls: {}", lev_amm_calls);
+    println!("Slow Recenter calls: {}", slow_recenter_calls);
     println!(
         "position {} value: {}",
         cfg.pool_config.stable_symbol(),
@@ -739,9 +850,26 @@ fn dispatch_regulate_debt(
     pool: &mut CorePool,
     target_cr_wad: U256,
     regulate_debt_calls: &mut u64,
+    log_returns: &[f64],
 ) -> bool {
     if cfg.is_regulate_debt && !vault.virtual_debt.is_zero() {
         vault.collect_fees(pool);
+
+        if cfg.use_dynamic_width && log_returns.len() >= 30 {
+            let n = log_returns.len() as f64;
+            let mean = log_returns.iter().sum::<f64>() / n;
+            let variance = log_returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n;
+            let steps_per_year = (365.25 * 24.0 * 3600.0) / (cfg.lookup_period as f64);
+            let annualized_vol = (variance * steps_per_year).sqrt();
+            vault.set_dynamic_thresholds(annualized_vol);
+        }
+
+        // LevAMM manages debt — regulateDebtFrom returns noop unconditionally.
+        if cfg.lev_amm.enabled {
+            *regulate_debt_calls += 1;
+            return false;
+        }
+
         let rd_mode = vault.regulate_debt(pool, None, target_cr_wad);
         if rd_mode == "mint" {
             vault.deploy_idle_to_lp(pool);
@@ -762,6 +890,8 @@ fn dispatch_dlv(
     curr_ms: i64,
     dlv_calls: &mut u64,
 ) {
+    // When LevAMM is enabled, TS rebalanceDebt() returns ZERO — LevAMM manages debt.
+    if cfg.lev_amm.enabled { return; }
     if cfg.is_regulate_debt && !vault.virtual_debt.is_zero() {
         let dlv_period_check = if let Some(p) = cfg.dlv.period {
             let dlv_cooldown_ms = p as i64 * 1000;
@@ -818,9 +948,10 @@ fn dispatch_alm(
     alm_calls: &mut u64,
     tick_count: u64,
 ) {
+    let allow_active = cfg.active_rebalance_mode != ActiveRebalanceMode::Passive;
     let charm_rebalance_period = vault.params.period as u64 / cfg.lookup_period as u64;
     let time_trigger = charm_rebalance_period > 0 && tick_count % charm_rebalance_period == 0;
-    let (ratio_trigger, dev_bps_val) = if cfg.active_rebalance_ratio_deviation_bps > 0 {
+    let (ratio_trigger, dev_bps_val) = if allow_active && cfg.active_rebalance_ratio_deviation_bps > 0 {
         let dev_bps = vault.share_deviation_bps(pool, None);
         (dev_bps >= cfg.active_rebalance_ratio_deviation_bps as u64, dev_bps)
     } else {

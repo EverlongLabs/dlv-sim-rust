@@ -102,7 +102,40 @@ pub fn execute_arb_close_gap(
     }
 
     let large_amount = I256(U256::from_u128(1_000_000_000_000_000_000_000));
-    let limit = Some(detection.target_sqrt_price_x96);
+
+    // Adjust price limit to ensure it's strictly past current (matches TS)
+    let current = pool.sqrt_price_x96();
+    let mut price_limit = detection.target_sqrt_price_x96;
+    if detection.zero_for_one {
+        if price_limit <= MIN_SQRT_RATIO { price_limit = MIN_SQRT_RATIO + U256::ONE; }
+        if price_limit >= current {
+            price_limit = if current > MIN_SQRT_RATIO { current - U256::ONE } else { MIN_SQRT_RATIO + U256::ONE };
+        }
+    } else {
+        if price_limit >= MAX_SQRT_RATIO { price_limit = MAX_SQRT_RATIO - U256::ONE; }
+        if price_limit <= current {
+            price_limit = if current < MAX_SQRT_RATIO { current + U256::ONE } else { MAX_SQRT_RATIO - U256::ONE };
+        }
+    }
+
+    let limit = Some(price_limit);
+
+    // Preview (read-only) to check profitability before executing
+    let preview = pool.query_swap(detection.zero_for_one, large_amount, limit);
+    let preview_profit = compute_arb_profit(
+        preview.amount0, preview.amount1,
+        detection.target_sqrt_price_x96,
+        is_volatile_token0,
+    );
+    if !preview_profit.is_positive() {
+        return ArbResult {
+            amount0: I256::ZERO,
+            amount1: I256::ZERO,
+            profit_stable: I256::ZERO,
+            zero_for_one: detection.zero_for_one,
+        };
+    }
+
     let (a0, a1) = pool.swap(detection.zero_for_one, large_amount, limit);
 
     let profit_stable = compute_arb_profit(
