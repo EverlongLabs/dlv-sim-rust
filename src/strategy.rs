@@ -417,6 +417,14 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
         let mut dlv_nav = U256::ZERO;
         let mut alm_nav = U256::ZERO;
 
+        let mut arb_fired = false;
+        let mut arb_pre_sqrt = U256::ZERO;
+        let mut arb_nav = U256::ZERO;
+        let mut arb_debt = U256::ZERO;
+        let mut lev_amm_fired = false;
+        let mut lev_amm_nav = U256::ZERO;
+        let mut lev_amm_debt = U256::ZERO;
+
         if cfg.is_arb_strategy {
             // ── ARB-ONLY MODE ──
             // Dispatch order: ARB → LEV_AMM → SLOW_RECENTER → DLV → ALM → REGULATE_DEBT
@@ -444,6 +452,7 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
                 }
 
                 if detection.is_arbitrable {
+                    arb_pre_sqrt = pool.sqrt_price_x96();
                     let result = arb::execute_arb_close_gap(&mut pool, &detection, cfg.pool_config.is_volatile_token0());
                     arb_profit = result.profit_stable.abs();
                     if result.profit_stable.is_positive() && !arb_profit.is_zero() && !cfg.no_arb_donation {
@@ -459,13 +468,21 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
                         vault.collect_fees(&mut pool);
                         vault.deploy_idle_to_lp(&mut pool);
                     }
+                    arb_fired = true;
+                    arb_nav = vault.total_pool_value(&pool, None);
+                    arb_debt = vault.virtual_debt;
                 }
             }
 
             // LevAMM
             if cfg.lev_amm.enabled {
-                vault.run_lev_amm_step(&mut pool, &cfg.lev_amm, target_cr_wad);
+                let (_fee, fired) = vault.run_lev_amm_step(&mut pool, &cfg.lev_amm, target_cr_wad);
                 lev_amm_calls += 1;
+                if fired {
+                    lev_amm_fired = true;
+                    lev_amm_nav = vault.total_pool_value(&pool, None);
+                    lev_amm_debt = vault.virtual_debt;
+                }
             }
 
             // Slow Recenter
@@ -548,7 +565,7 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
         // TS only calls registerLogSummary for ALM, DLV, SNAPSHOT, and circuit breakers)
         let alm_fired = alm_calls > prev_alm;
         let dlv_fired = dlv_calls > prev_dlv;
-        let event_fired = alm_fired || dlv_fired;
+        let _event_fired = alm_fired || dlv_fired;
 
         // TS fires SNAPSHOT independently of ALM/DLV — both can log on same tick.
         // Idle snapshot fires when interval elapsed (regardless of event).
@@ -608,32 +625,64 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             nav.lo as f64 / 10f64.powi(cfg.pool_config.stable_decimals() as i32);
         let price_f = vol_price_wad.lo as f64 / 1e18;
 
-        // TS registers ALM, DLV, and SNAPSHOT entries independently per tick.
-        // Each entry uses its own price/NAV: event entries use pre-dispatch price
-        // and post-dispatch NAV; idle snapshots use post-all-dispatch price and NAV.
+        // TS registers ARB, LEV_AMM, DLV, ALM, and SNAPSHOT entries independently
+        // per tick via registerLogSummary. Each entry uses its own price/NAV:
+        // event entries use pre-dispatch price and post-dispatch NAV; idle
+        // snapshots use post-all-dispatch price and NAV.
         let is_vol_t0 = cfg.pool_config.is_volatile_token0();
         let stable_scale = 10f64.powi(cfg.pool_config.stable_decimals() as i32);
-        let mut tick_btc_values: Vec<f64> = Vec::with_capacity(3);
 
+        struct RiskEntry {
+            btc_value: f64,
+            cr_pct: f64,
+        }
+        let mut tick_entries: Vec<RiskEntry> = Vec::with_capacity(5);
+
+        if arb_fired {
+            let p = Vault::volatile_price_wad(arb_pre_sqrt, is_vol_t0).lo as f64 / 1e18;
+            let v = arb_nav.lo as f64 / stable_scale;
+            if p > 0.0 {
+                let arb_cr = if arb_debt.is_zero() { f64::INFINITY }
+                    else { (arb_nav.lo as f64 + arb_debt.lo as f64) / arb_debt.lo as f64 * 100.0 };
+                tick_entries.push(RiskEntry { btc_value: v / p, cr_pct: arb_cr });
+            }
+        }
+        if lev_amm_fired {
+            let p = Vault::volatile_price_wad(pool.sqrt_price_x96(), is_vol_t0).lo as f64 / 1e18;
+            let v = lev_amm_nav.lo as f64 / stable_scale;
+            if p > 0.0 {
+                let la_cr = if lev_amm_debt.is_zero() { f64::INFINITY }
+                    else { (lev_amm_nav.lo as f64 + lev_amm_debt.lo as f64) / lev_amm_debt.lo as f64 * 100.0 };
+                tick_entries.push(RiskEntry { btc_value: v / p, cr_pct: la_cr });
+            }
+        }
         if dlv_fired {
             let p = Vault::volatile_price_wad(dlv_pre_sqrt, is_vol_t0).lo as f64 / 1e18;
             let v = dlv_nav.lo as f64 / stable_scale;
-            if p > 0.0 { tick_btc_values.push(v / p); }
+            if p > 0.0 {
+                let dlv_cr = vault.collateral_ratio_pct(&pool, None);
+                tick_entries.push(RiskEntry { btc_value: v / p, cr_pct: dlv_cr });
+            }
         }
         if alm_fired {
             let p = Vault::volatile_price_wad(alm_pre_sqrt, is_vol_t0).lo as f64 / 1e18;
             let v = alm_nav.lo as f64 / stable_scale;
-            if p > 0.0 { tick_btc_values.push(v / p); }
+            if p > 0.0 {
+                let alm_cr = vault.collateral_ratio_pct(&pool, None);
+                tick_entries.push(RiskEntry { btc_value: v / p, cr_pct: alm_cr });
+            }
         }
         if idle_snapshot_due {
+            let snap_cr = pre_replay_cr_pct.unwrap_or(cr_pct);
             if let Some(snap_btc) = pre_replay_snapshot_btc_value {
-                tick_btc_values.push(snap_btc);
+                tick_entries.push(RiskEntry { btc_value: snap_btc, cr_pct: snap_cr });
             } else if price_f > 0.0 {
-                tick_btc_values.push(vault_value_f / price_f);
+                tick_entries.push(RiskEntry { btc_value: vault_value_f / price_f, cr_pct: snap_cr });
             }
         }
 
-        for &btc_value in &tick_btc_values {
+        for entry in &tick_entries {
+            let btc_value = entry.btc_value;
             if first_apy_value.is_none() {
                 first_apy_value = Some((btc_value, curr_ms as f64));
             }
@@ -659,12 +708,10 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
                     .and_modify(|e| e.1 = btc_value)
                     .or_insert((btc_value, btc_value));
             }
-        }
 
-        if !tick_btc_values.is_empty() {
-            let effective_cr = pre_replay_cr_pct.unwrap_or(cr_pct);
-            if effective_cr.is_finite() && effective_cr > 0.0 && effective_cr < min_cr {
-                min_cr = effective_cr;
+            let ec = entry.cr_pct;
+            if ec.is_finite() && ec > 0.0 && ec < min_cr {
+                min_cr = ec;
             }
         }
 
@@ -890,8 +937,6 @@ fn dispatch_dlv(
     curr_ms: i64,
     dlv_calls: &mut u64,
 ) {
-    // When LevAMM is enabled, TS rebalanceDebt() returns ZERO — LevAMM manages debt.
-    if cfg.lev_amm.enabled { return; }
     if cfg.is_regulate_debt && !vault.virtual_debt.is_zero() {
         let dlv_period_check = if let Some(p) = cfg.dlv.period {
             let dlv_cooldown_ms = p as i64 * 1000;
@@ -922,17 +967,22 @@ fn dispatch_dlv(
                 }
             }
             if needs_dlv {
-                let debt_before = vault.virtual_debt;
-                vault.rebalance_debt_dlv(pool, target_cr_wad, cfg.dlv.debt_to_volatile_swap_fee);
-                let debt_after = vault.virtual_debt;
-                eprintln!("[DLV-ACT] debtBefore={} debtAfter={} diff={} idle0={} idle1={} totalSupply={}",
-                    debt_before.to_dec_string(), debt_after.to_dec_string(),
-                    if debt_before > debt_after { format!("-{}", (debt_before - debt_after).to_dec_string()) }
-                    else { format!("+{}", (debt_after - debt_before).to_dec_string()) },
-                    vault.idle0.to_dec_string(), vault.idle1.to_dec_string(),
-                    vault.total_supply.to_dec_string());
-                vault.last_rebalance_ms = curr_ms;
-                vault.last_debt_rebalance_ms = curr_ms;
+                // Under LevAMM, rebalanceDebt returns ZERO (noop) — LevAMM manages
+                // debt. But the DLV trigger still fires and TS still logs the entry
+                // (which feeds into registerLogSummary for risk metrics).
+                if !cfg.lev_amm.enabled {
+                    let debt_before = vault.virtual_debt;
+                    vault.rebalance_debt_dlv(pool, target_cr_wad, cfg.dlv.debt_to_volatile_swap_fee);
+                    let debt_after = vault.virtual_debt;
+                    eprintln!("[DLV-ACT] debtBefore={} debtAfter={} diff={} idle0={} idle1={} totalSupply={}",
+                        debt_before.to_dec_string(), debt_after.to_dec_string(),
+                        if debt_before > debt_after { format!("-{}", (debt_before - debt_after).to_dec_string()) }
+                        else { format!("+{}", (debt_after - debt_before).to_dec_string()) },
+                        vault.idle0.to_dec_string(), vault.idle1.to_dec_string(),
+                        vault.total_supply.to_dec_string());
+                    vault.last_rebalance_ms = curr_ms;
+                    vault.last_debt_rebalance_ms = curr_ms;
+                }
                 *dlv_calls += 1;
             }
         }
@@ -1086,8 +1136,8 @@ fn compute_risk_metrics(btc_values: &[f64], lookup_period_secs: u32) -> (f64, f6
 
     let mut rets: Vec<f64> = Vec::new();
     for i in 1..btc_values.len() {
-        let r = (btc_values[i] / btc_values[i - 1]).ln();
-        if r.is_finite() {
+        if btc_values[i - 1] > 0.0 {
+            let r = (btc_values[i] - btc_values[i - 1]) / btc_values[i - 1];
             rets.push(r);
         }
     }
@@ -1101,7 +1151,7 @@ fn compute_risk_metrics(btc_values: &[f64], lookup_period_secs: u32) -> (f64, f6
         .iter()
         .map(|r| (r - mean) * (r - mean))
         .sum::<f64>()
-        / (n - 1.0);
+        / n;
 
     let mut downside_sq_sum = 0.0;
     let mut downside_n = 0u64;

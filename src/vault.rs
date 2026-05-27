@@ -1801,12 +1801,14 @@ impl Vault {
         stable_part + full_math::mul_div(volatile_stable_part, fee_den - fee_num, fee_den)
     }
 
-    pub fn run_lev_amm_step(&mut self, pool: &mut CorePool, lev_amm_cfg: &LevAmmConfig, target_cr_wad: U256) -> U256 {
+    /// Returns (fee, fired) where fired=true when the step was NOT a noop.
+    pub fn run_lev_amm_step(&mut self, pool: &mut CorePool, lev_amm_cfg: &LevAmmConfig, target_cr_wad: U256) -> (U256, bool) {
         let price_wad = Self::pool_price(pool.sqrt_price_x96());
         let (t0, t1) = self.total_amounts(pool);
         let result = self.lev_amm_step_sync(t0, t1, price_wad, lev_amm_cfg, target_cr_wad);
+        let fired = self.pending_lev_amm_mode.is_some();
         self.apply_pending_lev_amm_op(pool, price_wad);
-        result.fee
+        (result.fee, fired)
     }
 
     fn lev_amm_step_sync(
