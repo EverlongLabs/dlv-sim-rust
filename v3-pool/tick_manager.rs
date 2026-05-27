@@ -23,6 +23,10 @@ impl TickManager {
 
     pub fn get_tick_and_init_if_absent(&mut self, tick_index: i32) -> &mut Tick {
         if !self.ticks.contains_key(&tick_index) {
+            if std::env::var("TRACE_GHOST_TICK").ok().map_or(false, |t| t == tick_index.to_string()) {
+                let bt = std::backtrace::Backtrace::force_capture();
+                eprintln!("[GHOST_TICK] Creating tick {} — backtrace:\n{}", tick_index, bt);
+            }
             self.ticks.insert(tick_index, Tick::new(tick_index));
         }
         self.ticks.get_mut(&tick_index).unwrap()
@@ -40,6 +44,10 @@ impl TickManager {
     }
 
     pub fn clear(&mut self, tick_index: i32) {
+        if std::env::var("TRACE_GHOST_TICK").ok().map_or(false, |t| t == tick_index.to_string()) {
+            let bt = std::backtrace::Backtrace::force_capture();
+            eprintln!("[GHOST_TICK_CLEAR] Clearing tick {} — backtrace:\n{}", tick_index, bt);
+        }
         self.ticks.remove(&tick_index);
     }
 
@@ -134,12 +142,8 @@ impl TickManager {
         fee_growth_global_0_x128: U256,
         fee_growth_global_1_x128: U256,
     ) -> (U256, U256) {
-        // Ensure ticks exist (init if absent)
-        self.get_tick_and_init_if_absent(tick_lower);
-        self.get_tick_and_init_if_absent(tick_upper);
-
-        let lower = self.ticks.get(&tick_lower).unwrap().clone();
-        let upper = self.ticks.get(&tick_upper).unwrap().clone();
+        let lower = self.get_tick_readonly(tick_lower);
+        let upper = self.get_tick_readonly(tick_upper);
 
         let (fee_growth_below_0, fee_growth_below_1) = if tick_current >= tick_lower {
             (

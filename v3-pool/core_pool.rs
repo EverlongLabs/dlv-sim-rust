@@ -262,6 +262,10 @@ impl CorePool {
             self.fee_growth_global_1_x128
         };
 
+        let do_trace = std::env::var("TRACE_SWAP_SQRT").ok()
+            .map_or(false, |s| U256::from_dec_str(&s) == self.sqrt_price_x96);
+        let mut loop_iter = 0u32;
+
         while !state_amount_specified_remaining.is_zero()
             && state_sqrt_price_x96 != sqrt_price_limit_x96
         {
@@ -283,6 +287,14 @@ impl CorePool {
                 sqrt_price_next_x96
             };
 
+            if do_trace {
+                eprintln!("[QS_TRACE] iter={} cur={} tick={} tick_next={} init={} sqrt_next={} limit={} target={} liq={} remaining={} z4o={} fee={}",
+                    loop_iter, state_sqrt_price_x96.to_dec_string(), state_tick, tick_next, initialized,
+                    sqrt_price_next_x96.to_dec_string(), sqrt_price_limit_x96.to_dec_string(),
+                    target.to_dec_string(), state_liquidity.to_dec_string(),
+                    state_amount_specified_remaining, zero_for_one, self.fee);
+            }
+
             let step = swap_math::compute_swap_step(
                 state_sqrt_price_x96,
                 target,
@@ -291,7 +303,15 @@ impl CorePool {
                 fee_amount_enum,
             );
 
+            if do_trace {
+                eprintln!("[QS_TRACE] iter={} step: next={} in={} out={} fee={}",
+                    loop_iter, step.sqrt_ratio_next_x96.to_dec_string(),
+                    step.amount_in.to_dec_string(), step.amount_out.to_dec_string(),
+                    step.fee_amount.to_dec_string());
+            }
+
             state_sqrt_price_x96 = step.sqrt_ratio_next_x96;
+            loop_iter += 1;
 
             if exact_input {
                 state_amount_specified_remaining = state_amount_specified_remaining
@@ -322,6 +342,9 @@ impl CorePool {
                     };
 
                     state_liquidity = liquidity_math::add_delta(state_liquidity, liquidity_net);
+                    if do_trace {
+                        eprintln!("[QS_TRACE] tick_cross tick={} liq_net={} new_liq={}", tick_next, liquidity_net, state_liquidity.to_dec_string());
+                    }
                 }
 
                 state_tick = if zero_for_one {
@@ -332,6 +355,10 @@ impl CorePool {
             } else if state_sqrt_price_x96 != sqrt_price_start_x96 {
                 state_tick = tick_math::get_tick_at_sqrt_ratio(state_sqrt_price_x96);
             }
+        }
+
+        if do_trace {
+            eprintln!("[QS_TRACE] final: iters={} remaining={} calculated={}", loop_iter, state_amount_specified_remaining, state_amount_calculated);
         }
 
         let (amount0, amount1) = if zero_for_one == exact_input {
@@ -345,6 +372,10 @@ impl CorePool {
                 I256(amount_specified.0 - state_amount_specified_remaining.0),
             )
         };
+
+        if do_trace {
+            eprintln!("[QS_TRACE] result: amount0={} amount1={}", amount0, amount1);
+        }
 
         SwapResult {
             amount0,

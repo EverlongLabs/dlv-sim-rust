@@ -162,8 +162,14 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
     );
     pool.initialize(initial_sqrt);
 
-    let start_ms = date_to_ms(cfg.start_date);
-    let end_ms = date_to_ms(cfg.end_date);
+    let mut start_ms = date_to_ms(cfg.start_date);
+    let mut end_ms = date_to_ms(cfg.end_date);
+
+    // Arb mode: override simulation range with arb config dates (matches TS line 2996-2997)
+    if cfg.is_arb_strategy {
+        start_ms = date_to_ms(cfg.arb.start_date);
+        end_ms = date_to_ms(cfg.arb.end_date);
+    }
 
     let sampling_ms = (cfg.lookup_period as i64) * 1000;
     let mut price_feed = price_feed::load_price_feed(
@@ -173,6 +179,14 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
         sampling_ms,
         &cfg.pool_config,
     );
+
+    // Clip end_ms to last available price feed entry (matches TS line 3002-3008)
+    if cfg.is_arb_strategy && price_feed.end_ms() < end_ms {
+        eprintln!(
+            "[ARB] endDate exceeds last price feed entry — clipping to avoid frozen-price tail."
+        );
+        end_ms = price_feed.end_ms();
+    }
 
     // Event-replay mode: load main events; warm-up is skipped when parquet
     // lacks mint events (zero external liquidity, vault becomes sole LP).
@@ -342,6 +356,10 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
     let mut last_slow_recenter_ms: i64 = 0;
     let w_const = U256::from_u128(1_000_000_000_000_000_000);
 
+    let mut arb_trace_file: Option<std::fs::File> = std::env::var("ARB_TRACE_FILE").ok().map(|p| {
+        std::fs::File::create(&p).unwrap_or_else(|e| panic!("Cannot create {}: {}", p, e))
+    });
+
     // APY + risk metrics tracking (pool price, matching TS with no quoter/oracle)
     let mut first_apy_value: Option<(f64, f64)> = None;
     let mut last_apy_value: Option<(f64, f64)> = None;
@@ -451,9 +469,28 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
                     }
                 }
 
+                if let Some(ref mut f) = arb_trace_file {
+                    use std::io::Write;
+                    let pre_sqrt = pool.sqrt_price_x96();
+                    let pre_liq = pool.liquidity();
+                    let _ = writeln!(f, "{}\t{}\t{}\t{}\t{:.1}\t{}\t{}", tick_count,
+                        if detection.is_arbitrable { 1 } else { 0 },
+                        pre_sqrt.to_dec_string(),
+                        ext_sqrt.to_dec_string(),
+                        detection.deviation_bps,
+                        pre_liq.to_dec_string(),
+                        detection.target_sqrt_price_x96.to_dec_string());
+                }
+
                 if detection.is_arbitrable {
                     arb_pre_sqrt = pool.sqrt_price_x96();
                     let result = arb::execute_arb_close_gap(&mut pool, &detection, cfg.pool_config.is_volatile_token0());
+                    if let Some(ref mut f) = arb_trace_file {
+                        use std::io::Write;
+                        let _ = writeln!(f, "{}\tARB_EXEC\ta0={}\ta1={}\tprofit={}\tpost_sqrt={}", tick_count,
+                            result.amount0, result.amount1, result.profit_stable,
+                            pool.sqrt_price_x96().to_dec_string());
+                    }
                     arb_profit = result.profit_stable.abs();
                     if result.profit_stable.is_positive() && !arb_profit.is_zero() && !cfg.no_arb_donation {
                         if cfg.pool_config.is_volatile_token0() {
@@ -937,7 +974,7 @@ fn dispatch_dlv(
     curr_ms: i64,
     dlv_calls: &mut u64,
 ) {
-    if cfg.is_regulate_debt && !vault.virtual_debt.is_zero() {
+    if !vault.virtual_debt.is_zero() {
         let dlv_period_check = if let Some(p) = cfg.dlv.period {
             let dlv_cooldown_ms = p as i64 * 1000;
             let dlv_time_since = curr_ms - vault.last_debt_rebalance_ms;

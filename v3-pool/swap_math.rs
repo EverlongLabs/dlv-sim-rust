@@ -181,3 +181,35 @@ pub fn compute_swap_step(
         fee_amount,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{U256, I256, FeeAmount};
+
+    #[test]
+    fn test_swap_step_tick_215822() {
+        let current = U256::from_dec_str("2077921856167377953745809051759");
+        let target = U256::from_dec_str("2100035313168839811738972618346");
+        let liquidity = U256::from_u128(7608560);
+        let large_amount = I256(U256::from_dec_str("1000000000000000000000")); // 1e21
+
+        let result = compute_swap_step(
+            current,
+            target,
+            liquidity,
+            large_amount,
+            FeeAmount::High, // 10000 ppm
+        );
+
+        eprintln!("sqrt_ratio_next = {}", result.sqrt_ratio_next_x96.to_dec_string());
+        eprintln!("amount_in = {}", result.amount_in.to_dec_string());
+        eprintln!("amount_out = {}", result.amount_out.to_dec_string());
+        eprintln!("fee_amount = {}", result.fee_amount.to_dec_string());
+
+        assert_eq!(result.sqrt_ratio_next_x96, target, "should reach target");
+        assert_eq!(result.amount_in, U256::from_u128(2123634), "amount_in mismatch");
+        assert_eq!(result.amount_out, U256::from_u128(3054), "amount_out mismatch");
+        assert_eq!(result.fee_amount, U256::from_u128(21451), "fee_amount mismatch");
+    }
+}

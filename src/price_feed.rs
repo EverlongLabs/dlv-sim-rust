@@ -179,24 +179,19 @@ pub fn price_to_sqrt_price_x96(usd_price: f64, pool_config: &PoolConfig) -> U256
     let volatile_decimals = pool_config.volatile_decimals() as i32;
     let stable_decimals = pool_config.stable_decimals() as i32;
 
-    // price in token1-per-token0 raw units
-    // If volatile is token1: priceRaw = 1/usd_price * 10^(token1_dec - token0_dec)
-    // If volatile is token0: priceRaw = usd_price * 10^(token1_dec - token0_dec)
     let price_raw_t1_per_t0: f64 = if pool_config.is_volatile_token0() {
-        // token0=volatile(BTC), token1=stable(USDC)
-        // price is USDC per BTC, raw = price * 10^(stable_dec - volatile_dec)
         usd_price * 10f64.powi(stable_decimals - volatile_decimals)
     } else {
-        // token0=stable(USDC), token1=volatile(BTC)
-        // price is USDC per BTC = 1/rate, but v3 price is token1/token0
-        // so sqrtPrice corresponds to price = token1_raw / token0_raw
-        // which is (1/usd_price) * 10^(volatile_dec - stable_dec)
         (1.0 / usd_price) * 10f64.powi(volatile_decimals - stable_decimals)
     };
 
-    // sqrtPriceX96 = sqrt(priceRawT1PerT0) * 2^96
-    let q96 = 2.0f64.powi(96);
-    let sqrt_val = price_raw_t1_per_t0.sqrt() * q96;
-    let rounded = sqrt_val.round() as u128;
-    U256::from_u128(rounded)
+    // Match TS: scale by 1e18, convert to bigint, then sqrt(scaled * Q192 / 1e18)
+    // Uses mul_div for 512-bit intermediate to avoid U256 overflow.
+    let scale: u128 = 1_000_000_000_000_000_000;
+    let price_scaled = (price_raw_t1_per_t0 * scale as f64).round() as u128;
+    let price_scaled_u = U256::from_u128(price_scaled);
+    let q192 = v3_pool::types::Q192;
+    let scale_u = U256::from_u128(scale);
+    let price_times_q192 = v3_pool::full_math::mul_div(price_scaled_u, q192, scale_u);
+    v3_pool::full_math::sqrt(price_times_q192)
 }

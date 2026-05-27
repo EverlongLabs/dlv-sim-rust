@@ -245,7 +245,25 @@ fn resolve_data_path(path: &str) -> String {
     }
 }
 
+fn resolve_latest_price_feed_date(dir: &str, fallback: NaiveDate) -> NaiveDate {
+    let Ok(entries) = std::fs::read_dir(dir) else { return fallback };
+    entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let csv_stem = name.strip_suffix(".csv")?;
+            let date_part = csv_stem.get(csv_stem.len().checked_sub(10)?..)?;
+            NaiveDate::parse_from_str(date_part, "%Y-%m-%d").ok()
+        })
+        .max()
+        .unwrap_or(fallback)
+}
+
 fn parse_arb_env(default_start: NaiveDate, default_end: NaiveDate) -> ArbParams {
+    // TS precedence: BF_START_DATE ?? BF_ARB_JSON.startDate ?? "2021-01-01"
+    let has_explicit_start = std::env::var("BF_START_DATE").is_ok();
+    let arb_fallback_start = NaiveDate::from_ymd_opt(2021, 1, 1).unwrap();
+
     if let Ok(json) = std::env::var("BF_ARB_JSON") {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
             let raw_dir = v["priceFeedDir"].as_str()
@@ -255,12 +273,21 @@ fn parse_arb_env(default_start: NaiveDate, default_end: NaiveDate) -> ArbParams 
                 "optimal" => ArbMode::Optimal,
                 _ => ArbMode::CloseGap,
             };
-            let start_date = v["startDate"].as_str()
-                .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
-                .unwrap_or(default_start);
-            let end_date = v["endDate"].as_str()
-                .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
-                .unwrap_or(default_end);
+            let start_date = if has_explicit_start {
+                default_start
+            } else {
+                v["startDate"].as_str()
+                    .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+                    .unwrap_or(arb_fallback_start)
+            };
+            let has_explicit_end = std::env::var("BF_END_DATE").is_ok();
+            let end_date = if has_explicit_end {
+                default_end
+            } else {
+                v["endDate"].as_str()
+                    .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+                    .unwrap_or_else(|| resolve_latest_price_feed_date(&price_feed_dir, default_end))
+            };
             return ArbParams { price_feed_dir, mode, start_date, end_date };
         }
     }

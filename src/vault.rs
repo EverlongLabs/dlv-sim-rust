@@ -204,6 +204,10 @@ impl Vault {
         }
     }
 
+    pub fn base_range_ticks(&self) -> (i32, i32) {
+        self.base.as_ref().map(|p| (p.tick_lower, p.tick_upper)).unwrap_or((0, 0))
+    }
+
     // ── Price helpers (match TS poolPrice / volatilePrice) ──
 
     pub fn pool_price(sqrt_price_x96: U256) -> U256 {

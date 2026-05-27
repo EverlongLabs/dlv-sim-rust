@@ -174,3 +174,43 @@ fn get_next_sqrt_price_from_amount1_rounding_down(
         sqrt_p_x96 - quotient
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::U256;
+
+    #[test]
+    fn test_amount0_delta_tick_215822() {
+        let current = U256::from_dec_str("2077921856167377953745809051759");
+        let target = U256::from_dec_str("2100035313168839811738972618346");
+        let liquidity = U256::from_u128(7608560);
+
+        let numerator1 = liquidity << 96;
+        let numerator2 = target - current;
+        eprintln!("numerator1 = {}", numerator1.to_dec_string());
+        eprintln!("numerator2 = {}", numerator2.to_dec_string());
+
+        let intermediate = crate::full_math::mul_div(numerator1, numerator2, target);
+        eprintln!("intermediate (mul_div) = {}", intermediate.to_dec_string());
+
+        let result = intermediate / current;
+        eprintln!("result (intermediate / current) = {}", result.to_dec_string());
+
+        assert_eq!(result, U256::from_u128(3054), "amount0 should be 3054");
+
+        let full_result = get_amount0_delta_unsigned(current, target, liquidity, false);
+        assert_eq!(full_result, U256::from_u128(3054), "get_amount0_delta_unsigned should be 3054");
+    }
+
+    #[test]
+    fn test_amount1_delta_tick_215822() {
+        let current = U256::from_dec_str("2077921856167377953745809051759");
+        let target = U256::from_dec_str("2100035313168839811738972618346");
+        let liquidity = U256::from_u128(7608560);
+
+        let result = get_amount1_delta_unsigned(current, target, liquidity, true);
+        eprintln!("amount1_delta(roundUp=true) = {}", result.to_dec_string());
+        assert_eq!(result, U256::from_u128(2123634), "amount1 should be 2123634");
+    }
+}

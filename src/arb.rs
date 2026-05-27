@@ -128,6 +128,12 @@ pub fn execute_arb_close_gap(
         is_volatile_token0,
     );
     if !preview_profit.is_positive() {
+        if std::env::var("ARB_TRACE_FILE").is_ok() {
+            eprintln!("[ARB_PREVIEW_FAIL] z4o={} liq={} cur={} limit={} preview=({},{}) profit={}",
+                detection.zero_for_one, pool.liquidity().to_dec_string(),
+                current.to_dec_string(), price_limit.to_dec_string(),
+                preview.amount0, preview.amount1, preview_profit);
+        }
         return ArbResult {
             amount0: I256::ZERO,
             amount1: I256::ZERO,
