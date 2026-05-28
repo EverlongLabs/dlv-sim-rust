@@ -397,6 +397,13 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
     let mut pre_replay_cr_pct: Option<f64> = None;
     let mut pre_replay_snapshot_btc_value: Option<f64> = None;
 
+    // TS SNAPSHOT_PENDING_KEY: set when DLV trigger returns false (CR within
+    // deviation threshold), cleared at start of next period's RD act. Drives
+    // whether the period's SNAP entry fires EARLY (during RD act, pre-DLV-ALM
+    // state, pushed before ALM/DLV entries) or LATE (during SNAPSHOT dispatch
+    // at end of period, post-ALM state, pushed after).
+    let mut snapshot_pending: bool = false;
+
     while curr_ms < end_ms {
         tick_count += 1;
         pre_replay_cr_pct = None;
@@ -404,6 +411,21 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
         if let Some(max) = cfg.max_ticks {
             if tick_count > max { break; }
         }
+
+        // Capture period-start state for SNAPSHOT entries. TS logs the SNAPSHOT
+        // entry inside RD act (when SNAPSHOT_PENDING is set from prior period's
+        // DLV trigger) — that fires BEFORE DLV/ALM dispatch and captures
+        // post-collect_fees-but-pre-rebalance state. collect_fees is invariant
+        // for total_pool_value (it just moves unpoked fees from LP into idle),
+        // so capturing here (before any dispatch) is equivalent.
+        let start_cr_pct = vault.collateral_ratio_pct(&pool, None);
+        let start_snapshot_btc_value: Option<f64> = {
+            let s = pool.sqrt_price_x96();
+            let v = vault.total_pool_value(&pool, None).lo as f64
+                / 10f64.powi(cfg.pool_config.stable_decimals() as i32);
+            let p = Vault::volatile_price_wad(s, cfg.pool_config.is_volatile_token0()).lo as f64 / 1e18;
+            if p > 0.0 { Some(v / p) } else { None }
+        };
 
         // Get external price (used for APY/risk tracking in both modes)
         let (ext_price, ext_sqrt) = price_feed.get_price_at_monotonic(curr_ms);
@@ -426,6 +448,7 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
         let prev_alm = alm_calls;
         let prev_dlv = dlv_calls;
         let mut _rd_fired = false;
+        let mut snapshot_pending_at_start: bool = false;
         // TS captures snapshot price BEFORE each rebalance (collectVaultSnapshotInputs
         // runs before the swap). Track per-event pre-dispatch sqrt for btcValue computation.
         let mut dlv_pre_sqrt = U256::ZERO;
@@ -550,13 +573,24 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             // ── EVENT-REPLAY MODE ──
             // Dispatch order: REGULATE_DEBT → DLV → ALM → (replay events)
 
+            // Capture pending state from prior period before RD clears it.
+            // This determines whether THIS period's SNAP (if due) fires early.
+            snapshot_pending_at_start = snapshot_pending;
+
             // Regulate debt (runs FIRST in event-replay mode)
             _rd_fired = dispatch_regulate_debt(cfg, &mut vault, &mut pool, target_cr_wad, &mut regulate_debt_calls, &log_returns);
+            // TS clears SNAPSHOT_PENDING_KEY inside RD act regardless of mint/burn outcome.
+            snapshot_pending = false;
 
             // DLV
             dlv_pre_sqrt = pool.sqrt_price_x96();
             dispatch_dlv(cfg, &mut vault, &mut pool, target_cr_wad, w_const, curr_ms, &mut dlv_calls, tick_count);
             dlv_nav = vault.total_pool_value(&pool, None);
+            // TS DLV trigger sets SNAPSHOT_PENDING_KEY=true when DLV does NOT
+            // fire (CR within deviation threshold). Mirror that here.
+            if dlv_calls == prev_dlv {
+                snapshot_pending = true;
+            }
 
             // ALM
             alm_pre_sqrt = pool.sqrt_price_x96();
@@ -715,16 +749,31 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
         struct RiskEntry {
             btc_value: f64,
             cr_pct: f64,
+            source: &'static str,
         }
         let mut tick_entries: Vec<RiskEntry> = Vec::with_capacity(5);
 
+        // Determine SNAP placement:
+        // - EARLY SNAP: when SNAPSHOT_PENDING was true at start of period AND
+        //   RD didn't mint/burn (TS logs SNAP inside RD act in this case,
+        //   before DLV/ALM dispatch). State captured: start-of-period (matches
+        //   TS's post-collect_fees state since collect_fees is invariant for
+        //   total_pool_value).
+        // - LATE SNAP: otherwise, SNAP fires during TS's SNAPSHOT dispatch at
+        //   end of period using post-ALM state.
+        let early_snap_fires = idle_snapshot_due && snapshot_pending_at_start && !_rd_fired;
+        if early_snap_fires {
+            if let Some(snap_btc) = start_snapshot_btc_value {
+                tick_entries.push(RiskEntry { btc_value: snap_btc, cr_pct: start_cr_pct, source: "SNAP" });
+            }
+        }
         if arb_fired {
             let p = Vault::volatile_price_wad(arb_pre_sqrt, is_vol_t0).lo as f64 / 1e18;
             let v = arb_nav.lo as f64 / stable_scale;
             if p > 0.0 {
                 let arb_cr = if arb_debt.is_zero() { f64::INFINITY }
                     else { (arb_nav.lo as f64 + arb_debt.lo as f64) / arb_debt.lo as f64 * 100.0 };
-                tick_entries.push(RiskEntry { btc_value: v / p, cr_pct: arb_cr });
+                tick_entries.push(RiskEntry { btc_value: v / p, cr_pct: arb_cr, source: "ARB" });
             }
         }
         if lev_amm_fired {
@@ -733,7 +782,7 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             if p > 0.0 {
                 let la_cr = if lev_amm_debt.is_zero() { f64::INFINITY }
                     else { (lev_amm_nav.lo as f64 + lev_amm_debt.lo as f64) / lev_amm_debt.lo as f64 * 100.0 };
-                tick_entries.push(RiskEntry { btc_value: v / p, cr_pct: la_cr });
+                tick_entries.push(RiskEntry { btc_value: v / p, cr_pct: la_cr, source: "LEV_AMM" });
             }
         }
         if dlv_fired {
@@ -741,23 +790,34 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             let v = dlv_nav.lo as f64 / stable_scale;
             if p > 0.0 {
                 let dlv_cr = vault.collateral_ratio_pct(&pool, None);
-                tick_entries.push(RiskEntry { btc_value: v / p, cr_pct: dlv_cr });
+                tick_entries.push(RiskEntry { btc_value: v / p, cr_pct: dlv_cr, source: "DLV" });
             }
         }
         if alm_fired {
-            let p = Vault::volatile_price_wad(alm_pre_sqrt, is_vol_t0).lo as f64 / 1e18;
+            let vol_price_wad = Vault::volatile_price_wad(alm_pre_sqrt, is_vol_t0);
+            let p = vol_price_wad.lo as f64 / 1e18;
             let v = alm_nav.lo as f64 / stable_scale;
             if p > 0.0 {
                 let alm_cr = vault.collateral_ratio_pct(&pool, None);
-                tick_entries.push(RiskEntry { btc_value: v / p, cr_pct: alm_cr });
+                if std::env::var("ALM_BTC_DIAG").is_ok() {
+                    eprintln!("[ALM-BTC-DIAG] alm_n={} tick={} alm_pre_sqrt={} vol_price_wad={} alm_nav={} p={:.18e} v={:.18e} btc={:.18e}",
+                        alm_calls, tick_count,
+                        alm_pre_sqrt.to_dec_string(),
+                        vol_price_wad.to_dec_string(),
+                        alm_nav.to_dec_string(),
+                        p, v, v / p);
+                }
+                tick_entries.push(RiskEntry { btc_value: v / p, cr_pct: alm_cr, source: "ALM" });
             }
         }
-        if idle_snapshot_due {
+        // LATE SNAP: when SNAP didn't fire early, push it here using post-ALM
+        // state (matches TS's SNAPSHOT dispatch at end of period).
+        if idle_snapshot_due && !early_snap_fires {
             let snap_cr = pre_replay_cr_pct.unwrap_or(cr_pct);
             if let Some(snap_btc) = pre_replay_snapshot_btc_value {
-                tick_entries.push(RiskEntry { btc_value: snap_btc, cr_pct: snap_cr });
+                tick_entries.push(RiskEntry { btc_value: snap_btc, cr_pct: snap_cr, source: "SNAP" });
             } else if price_f > 0.0 {
-                tick_entries.push(RiskEntry { btc_value: vault_value_f / price_f, cr_pct: snap_cr });
+                tick_entries.push(RiskEntry { btc_value: vault_value_f / price_f, cr_pct: snap_cr, source: "SNAP" });
             }
         }
 
@@ -769,6 +829,15 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             last_apy_value = Some((btc_value, curr_ms as f64));
 
             if btc_value > 0.0 && btc_value.is_finite() {
+                if std::env::var("BTC_SRC_DUMP").is_ok() {
+                    eprintln!("[BTC-SRC] idx={} source={} tick={} btc={:.18e}", btc_values_for_risk.len(), entry.source, tick_count, btc_value);
+                }
+                if let Ok(path) = std::env::var("BTC_SRC_DUMP_PATH") {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                        let _ = writeln!(f, "{} {} t={} btc={:.18e}", btc_values_for_risk.len(), entry.source, curr_ms, btc_value);
+                    }
+                }
                 btc_values_for_risk.push(btc_value);
 
                 if btc_value > peak_btc_value {
@@ -1233,11 +1302,20 @@ fn compute_risk_metrics(btc_values: &[f64], lookup_period_secs: u32) -> (f64, f6
         return (0.0, 0.0, 0.0);
     }
 
+    if let Ok(path) = std::env::var("BTC_DUMP_PATH") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::File::create(&path) {
+            for (i, v) in btc_values.iter().enumerate() {
+                let _ = writeln!(f, "{} {:.18e}", i, v);
+            }
+        }
+    }
+
     let mut rets: Vec<f64> = Vec::new();
     for i in 1..btc_values.len() {
         if btc_values[i - 1] > 0.0 {
-            let r = (btc_values[i] - btc_values[i - 1]) / btc_values[i - 1];
-            rets.push(r);
+            let r = (btc_values[i] / btc_values[i - 1]).ln();
+            if r.is_finite() { rets.push(r); }
         }
     }
     if rets.len() < 2 {
@@ -1250,7 +1328,17 @@ fn compute_risk_metrics(btc_values: &[f64], lookup_period_secs: u32) -> (f64, f6
         .iter()
         .map(|r| (r - mean) * (r - mean))
         .sum::<f64>()
-        / n;
+        / (n - 1.0);
+
+    if std::env::var("RISK_DIAG").is_ok() {
+        let neg_count = rets.iter().filter(|r| **r < 0.0).count();
+        let pos_count = rets.iter().filter(|r| **r > 0.0).count();
+        let zero_count = rets.iter().filter(|r| **r == 0.0).count();
+        let min_abs_neg = rets.iter().filter(|r| **r < 0.0).map(|r| r.abs()).fold(f64::INFINITY, f64::min);
+        let min_abs_pos = rets.iter().filter(|r| **r > 0.0).map(|r| r.abs()).fold(f64::INFINITY, f64::min);
+        eprintln!("[RISK-DIAG] rets.len={} neg={} pos={} zero={} btc.len={} mean={:.18e} variance={:.18e} min_abs_neg={:.18e} min_abs_pos={:.18e}",
+            rets.len(), neg_count, pos_count, zero_count, btc_values.len(), mean, variance, min_abs_neg, min_abs_pos);
+    }
 
     let mut downside_sq_sum = 0.0;
     let mut downside_n = 0u64;
