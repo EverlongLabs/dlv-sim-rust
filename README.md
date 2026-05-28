@@ -3,6 +3,52 @@
 Rust port of the TypeScript DLV vault simulator at `../dlv-sim`. Produces
 bit-identical RESULT_JSON given the same inputs.
 
+## Quick start — Docker Compose
+
+Build the image once (or after source changes), then run any preset:
+
+```bash
+docker compose build
+```
+
+### KATANA_5BP arb-mode parity preset (LevAMM + slow recenter + dynamic width)
+
+Full 2-year window (2024-04-21 → 2026-04-21, ~5.3M periods @ 12s), 8 GB RAM:
+
+```bash
+docker compose run --rm katana-5bp-2y
+```
+
+Parse-only diagnostic (prints parsed config and exits, no simulation):
+
+```bash
+docker compose run --rm -e CONFIG_ONLY=1 katana-5bp-2y
+```
+
+Shorter window:
+
+```bash
+docker compose run --rm -e BF_END_DATE=2024-06-21 katana-5bp-2y   # 2 months
+docker compose run --rm -e BF_END_DATE=2024-10-21 katana-5bp-2y   # 6 months
+docker compose run --rm -e BF_END_DATE=2025-04-21 katana-5bp-2y   # 1 year
+```
+
+All env vars come from `scripts/katana-5bp-2y.docker.env` via the compose
+service's `env_file:` directive, so the ~3.5 KB of `BF_*_JSON` survives any
+shell-delivery quirks.
+
+### Simple event-replay presets (WBTC/USDC, cbBTC/USDC)
+
+These use the generic `dlv-sim` service with env vars passed inline:
+
+```bash
+# WBTC/USDC, 6-month event-replay
+docker compose run --rm -e BF_POOL=wbtc_usdc -e ARB_STRATEGY=false dlv-sim
+
+# cbBTC/USDC, 6-month event-replay
+docker compose run --rm -e BF_POOL=cbbtc_usdc_base -e ARB_STRATEGY=false dlv-sim
+```
+
 ## Prerequisites
 
 - Rust ≥ 1.87 (or use the Dockerfile)
@@ -10,7 +56,7 @@ bit-identical RESULT_JSON given the same inputs.
   Binance CSV feed for arb-mode configs
 - For the TS comparison side: a working `../dlv-sim` checkout (`yarn install` etc.)
 
-Build once:
+Local build (skip if using Docker):
 
 ```bash
 cargo build --release
@@ -156,13 +202,31 @@ set):
 | `DAILY_DIAG=1` | every-7200-ticks state dump |
 | `TICK_DIAG=N` | first N ticks per-tick state dump |
 
-## Docker (still works)
+## Adding new docker-compose parity presets
 
-```bash
-docker compose run --rm -e BF_POOL=wbtc_usdc -e ARB_STRATEGY=false dlv-sim 2>&1 | grep RESULT_JSON
-```
+To add another arb-mode / long-config preset:
 
-Docker is convenient for the simple WBTC/USDC and cbBTC/USDC configs that don't
-need the giant `BF_*_JSON` chain. For the arb-mode KATANA_5BP runs, use
-`scripts/run-katana-5bp-2y.sh` directly — the script wrapper is what protects
-the JSON env vars from shell delivery quirks.
+1. Create `scripts/<name>.docker.env` in Docker `--env-file` format
+   (no quotes around JSON values, no `export` keyword, one `KEY=VALUE`
+   per physical line).
+2. Add a new service block to `docker-compose.yml`:
+
+   ```yaml
+   <name>:
+     build: .
+     mem_limit: 8g
+     volumes:
+       - ../dlv-sim/data:/dlv-sim/data:ro
+       - ./output:/app/output
+     env_file:
+       - scripts/<name>.docker.env
+   ```
+
+3. Run it:
+
+   ```bash
+   docker compose run --rm <name>
+   ```
+
+The data volume must mount at `/dlv-sim/data` (not `/app/data`) so the
+binary's hardcoded `../dlv-sim/data/...` paths resolve from `WORKDIR /app`.
