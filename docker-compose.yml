@@ -1,8 +1,11 @@
 services:
   dlv-sim:
     build: .
+    mem_limit: 8g
+    # Mount at /dlv-sim/data so the binary's hardcoded paths
+    # ("../dlv-sim/data/...") resolve from the WORKDIR /app.
     volumes:
-      - ../dlv-sim/data:/app/data:ro
+      - ../dlv-sim/data:/dlv-sim/data:ro
       - ./output:/app/output
     environment:
       - RUST_BACKTRACE=0
@@ -16,3 +19,22 @@ services:
       - ALM_ONLY=${ALM_ONLY:-false}
       - ARB_MODE=${ARB_MODE:-close_gap}
       - ACTIVE_REBALANCE_RATIO_DEVIATION_BPS=${ACTIVE_REBALANCE_RATIO_DEVIATION_BPS:-100}
+
+  # Parity preset: KATANA_5BP arb-mode (LevAMM + slow recenter + dynamic width),
+  # 2-year window. All env vars read from scripts/katana-5bp-2y.docker.env so the
+  # ~3.5 KB of BF_*_JSON survives shell delivery quirks.
+  # Usage:
+  #   docker compose build
+  #   docker compose run --rm katana-5bp-2y
+  # Override the end date for a shorter window:
+  #   docker compose run --rm -e BF_END_DATE=2024-10-21 katana-5bp-2y
+  katana-5bp-2y:
+    build: .
+    mem_limit: 8g
+    # Mount at /dlv-sim/data so the binary's hardcoded paths
+    # ("../dlv-sim/data/...") resolve from the WORKDIR /app.
+    volumes:
+      - ../dlv-sim/data:/dlv-sim/data:ro
+      - ./output:/app/output
+    env_file:
+      - scripts/katana-5bp-2y.docker.env
