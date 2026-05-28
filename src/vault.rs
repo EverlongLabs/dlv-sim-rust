@@ -1579,6 +1579,27 @@ impl Vault {
         (lp0 + fees0 + self.idle0, lp1 + fees1 + self.idle1)
     }
 
+    /// Like total_amounts but values the LP positions at an override sqrt price.
+    /// Fees are still read against the real pool tick (matching TS
+    /// getTotalAmounts(false, overrideSqrt), where overrideSqrt only changes
+    /// the price used by amountsForLiquidityGivenPrice).
+    pub fn total_amounts_at(&self, pool: &CorePool, override_sqrt: Option<U256>) -> (U256, U256) {
+        let sqrt_price = override_sqrt.unwrap_or_else(|| pool.sqrt_price_x96());
+        let mut t0 = U256::ZERO;
+        let mut t1 = U256::ZERO;
+        for pos in [&self.wide, &self.base, &self.limit] {
+            if let Some(p) = pos {
+                if !p.liquidity.is_zero() {
+                    let (a0, a1) = amounts_for_liquidity(sqrt_price, p.tick_lower, p.tick_upper, p.liquidity);
+                    t0 = t0 + a0;
+                    t1 = t1 + a1;
+                }
+            }
+        }
+        let (f0, f1) = self.all_fees(pool);
+        (t0 + f0 + self.idle0, t1 + f1 + self.idle1)
+    }
+
     pub fn lp_amounts_round_up(&self, pool: &CorePool) -> (U256, U256) {
         let sqrt_price = pool.sqrt_price_x96();
         let mut total0 = U256::ZERO;
@@ -1822,9 +1843,14 @@ impl Vault {
     }
 
     /// Returns (fee, fired) where fired=true when the step was NOT a noop.
-    pub fn run_lev_amm_step(&mut self, pool: &mut CorePool, lev_amm_cfg: &LevAmmConfig, target_cr_wad: U256) -> (U256, bool) {
-        let price_wad = Self::pool_price(pool.sqrt_price_x96());
-        let (t0, t1) = self.total_amounts(pool);
+    /// `override_sqrt` selects the price source used for both `priceWad` and
+    /// the totals fed into `lev_amm_step_sync`. TS uses Binance external sqrt
+    /// when `dlvConfig.almSwapPriceSource === "binance"`; pass `None` to use
+    /// the pool's current sqrt (TS "30bp" / unset).
+    pub fn run_lev_amm_step(&mut self, pool: &mut CorePool, lev_amm_cfg: &LevAmmConfig, target_cr_wad: U256, override_sqrt: Option<U256>) -> (U256, bool) {
+        let sqrt = override_sqrt.unwrap_or_else(|| pool.sqrt_price_x96());
+        let price_wad = Self::pool_price(sqrt);
+        let (t0, t1) = self.total_amounts_at(pool, override_sqrt);
         let result = self.lev_amm_step_sync(t0, t1, price_wad, lev_amm_cfg, target_cr_wad);
         let fired = self.pending_lev_amm_mode.is_some();
         self.apply_pending_lev_amm_op(pool, price_wad);

@@ -466,9 +466,28 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
         let mut lev_amm_nav = U256::ZERO;
         let mut lev_amm_debt = U256::ZERO;
 
+        // Per-step parity log gate (env ARB_PARITY_START/ARB_PARITY_END)
+        let arb_parity_active = std::env::var("ARB_PARITY_START").ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .zip(std::env::var("ARB_PARITY_END").ok().and_then(|v| v.parse::<u64>().ok()))
+            .map_or(false, |(s, e)| tick_count >= s && tick_count <= e);
+        let log_arb_parity = |stage: &str, vault: &Vault, pool: &CorePool, tc: u64| {
+            if !arb_parity_active { return; }
+            let (t0, t1) = vault.total_amounts(pool);
+            let cr_wad = vault.collateral_ratio_wad(pool, None);
+            eprintln!(
+                "[ARB-PARITY] tick={} stage={} pool_tick={} total0={} total1={} idle0={} idle1={} vdebt={} cr_wad={}",
+                tc, stage, pool.tick_current(),
+                t0.to_dec_string(), t1.to_dec_string(),
+                vault.idle0.to_dec_string(), vault.idle1.to_dec_string(),
+                vault.virtual_debt.to_dec_string(),
+                cr_wad.to_dec_string());
+        };
+
         if cfg.is_arb_strategy {
             // ── ARB-ONLY MODE ──
             // Dispatch order: ARB → LEV_AMM → SLOW_RECENTER → DLV → ALM → REGULATE_DEBT
+            log_arb_parity("pre", &vault, &pool, tick_count);
 
             if ext_price > 0.0 {
                 let detection = arb::detect_arb(pool.sqrt_price_x96(), ext_sqrt, fee);
@@ -533,10 +552,19 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
                     arb_debt = vault.virtual_debt;
                 }
             }
+            log_arb_parity("post_arb", &vault, &pool, tick_count);
 
             // LevAMM
             if cfg.lev_amm.enabled {
-                let (_fee, fired) = vault.run_lev_amm_step(&mut pool, &cfg.lev_amm, target_cr_wad);
+                // TS routes the LevAMM step through resolveAlmSwapSqrt(variable):
+                //   "30bp" → pool sqrt (None override)
+                //   "5bp"  → 5bp quoter sqrt (not modelled in Rust yet)
+                //   "binance" → external feed sqrt
+                let lev_amm_override = match cfg.dlv.alm_swap_price_source.as_str() {
+                    "binance" => if ext_sqrt.is_zero() { None } else { Some(ext_sqrt) },
+                    _ => None,
+                };
+                let (_fee, fired) = vault.run_lev_amm_step(&mut pool, &cfg.lev_amm, target_cr_wad, lev_amm_override);
                 lev_amm_calls += 1;
                 if fired {
                     lev_amm_fired = true;
@@ -544,6 +572,7 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
                     lev_amm_debt = vault.virtual_debt;
                 }
             }
+            log_arb_parity("post_lev_amm", &vault, &pool, tick_count);
 
             // Slow Recenter
             if cfg.slow_recenter.enabled {
@@ -556,19 +585,23 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
                     }
                 }
             }
+            log_arb_parity("post_sr", &vault, &pool, tick_count);
 
             // DLV
             dlv_pre_sqrt = pool.sqrt_price_x96();
             dispatch_dlv(cfg, &mut vault, &mut pool, target_cr_wad, w_const, curr_ms, &mut dlv_calls, tick_count);
             dlv_nav = vault.total_pool_value(&pool, None);
+            log_arb_parity("post_dlv", &vault, &pool, tick_count);
 
             // ALM
             alm_pre_sqrt = pool.sqrt_price_x96();
             dispatch_alm(cfg, &mut vault, &mut pool, ext_sqrt, curr_ms, &mut alm_calls, tick_count);
             alm_nav = vault.total_pool_value(&pool, None);
+            log_arb_parity("post_alm", &vault, &pool, tick_count);
 
             // Regulate debt (runs LAST in arb mode)
             _rd_fired = dispatch_regulate_debt(cfg, &mut vault, &mut pool, target_cr_wad, &mut regulate_debt_calls, &log_returns);
+            log_arb_parity("post_rd", &vault, &pool, tick_count);
         } else {
             // ── EVENT-REPLAY MODE ──
             // Dispatch order: REGULATE_DEBT → DLV → ALM → (replay events)

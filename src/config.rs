@@ -18,6 +18,11 @@ pub struct DlvParams {
     pub deviation_threshold_above: Option<f64>,
     pub deviation_threshold_below: Option<f64>,
     pub debt_to_volatile_swap_fee: f64,
+    /// Price source for the LevAMM step + DLV/ALM swap output valuation.
+    /// Matches TS's dlvConfig.almSwapPriceSource: "30bp" (pool price),
+    /// "5bp" (5bp quoter — not implemented in Rust), or "binance" (external feed).
+    /// Default "5bp" to match TS's default.
+    pub alm_swap_price_source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -360,6 +365,7 @@ fn parse_dlv_env() -> DlvParams {
                 deviation_threshold_above: v["deviationThresholdAbove"].as_f64(),
                 deviation_threshold_below: v["deviationThresholdBelow"].as_f64(),
                 debt_to_volatile_swap_fee: v["debtToVolatileSwapFee"].as_f64().unwrap_or(0.0015),
+                alm_swap_price_source: v["almSwapPriceSource"].as_str().unwrap_or("5bp").to_string(),
             };
         }
     }
@@ -368,5 +374,6 @@ fn parse_dlv_env() -> DlvParams {
         deviation_threshold_above: Some(0.01),
         deviation_threshold_below: Some(0.01),
         debt_to_volatile_swap_fee: 0.0015,
+        alm_swap_price_source: "5bp".to_string(),
     }
 }
