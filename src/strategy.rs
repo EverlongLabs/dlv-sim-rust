@@ -536,7 +536,7 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
 
             // DLV
             dlv_pre_sqrt = pool.sqrt_price_x96();
-            dispatch_dlv(cfg, &mut vault, &mut pool, target_cr_wad, w_const, curr_ms, &mut dlv_calls);
+            dispatch_dlv(cfg, &mut vault, &mut pool, target_cr_wad, w_const, curr_ms, &mut dlv_calls, tick_count);
             dlv_nav = vault.total_pool_value(&pool, None);
 
             // ALM
@@ -555,7 +555,7 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
 
             // DLV
             dlv_pre_sqrt = pool.sqrt_price_x96();
-            dispatch_dlv(cfg, &mut vault, &mut pool, target_cr_wad, w_const, curr_ms, &mut dlv_calls);
+            dispatch_dlv(cfg, &mut vault, &mut pool, target_cr_wad, w_const, curr_ms, &mut dlv_calls, tick_count);
             dlv_nav = vault.total_pool_value(&pool, None);
 
             // ALM
@@ -577,6 +577,22 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
                 }
             }
 
+            // Per-tick window dump (env TICK_DUMP_START..TICK_DUMP_END to dump state per tick in window)
+            if let (Ok(start_s), Ok(end_s)) = (std::env::var("TICK_DUMP_START"), std::env::var("TICK_DUMP_END")) {
+                if let (Ok(start), Ok(end)) = (start_s.parse::<u64>(), end_s.parse::<u64>()) {
+                    if tick_count >= start && tick_count <= end {
+                        let (t0, t1) = vault.total_amounts(&pool);
+                        let cr_wad = vault.collateral_ratio_wad(&pool, None);
+                        eprintln!("[TICK-WIN] tick={} pool_tick={} total0={} total1={} idle0={} idle1={} vdebt={} cr_wad={}",
+                            tick_count, pool.tick_current(),
+                            t0.to_dec_string(), t1.to_dec_string(),
+                            vault.idle0.to_dec_string(), vault.idle1.to_dec_string(),
+                            vault.virtual_debt.to_dec_string(),
+                            cr_wad.to_dec_string());
+                    }
+                }
+            }
+
             // Capture pre-replay state for metrics (TS computes CR and
             // SNAPSHOT btcValue before replay events shift the pool price)
             pre_replay_cr_pct = Some(vault.collateral_ratio_pct(&pool, None));
@@ -590,11 +606,38 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
 
             // Replay events up to next period boundary
             let next_ms = curr_ms + step_ms;
+            let trace_replay = {
+                let single = std::env::var("REPLAY_TRACE_TICK")
+                    .ok().and_then(|v| v.parse::<u64>().ok())
+                    .map_or(false, |t| t == tick_count);
+                let win = match (std::env::var("REPLAY_TRACE_WIN_START").ok().and_then(|v| v.parse::<u64>().ok()),
+                                 std::env::var("REPLAY_TRACE_WIN_END").ok().and_then(|v| v.parse::<u64>().ok())) {
+                    (Some(s), Some(e)) => tick_count >= s && tick_count <= e,
+                    _ => false,
+                };
+                single || win
+            };
             while event_cursor < main_events.len() {
                 let event = &main_events[event_cursor];
                 if event.date_ms >= next_ms { break; }
                 event_cursor += 1;
-                replay_event(&mut pool, event);
+                if trace_replay {
+                    let before_sqrt = pool.sqrt_price_x96();
+                    let before_tick = pool.tick_current();
+                    replay_event(&mut pool, event);
+                    let after_sqrt = pool.sqrt_price_x96();
+                    let after_tick = pool.tick_current();
+                    let evt_type = format!("{:?}", event.event_type);
+                    let evt_sqrt = event.sqrt_price_x96.map(|s| s.to_dec_string()).unwrap_or_else(|| "-".into());
+                    eprintln!("[REPLAY-TRACE] tick={} evt_type={} evt_a0={} evt_a1={} evt_sqrt={} before_sqrt={} before_tick={} after_sqrt={} after_tick={}",
+                        tick_count, evt_type,
+                        event.amount0.to_dec_string(), event.amount1.to_dec_string(),
+                        evt_sqrt,
+                        before_sqrt.to_dec_string(), before_tick,
+                        after_sqrt.to_dec_string(), after_tick);
+                } else {
+                    replay_event(&mut pool, event);
+                }
             }
         }
 
@@ -973,6 +1016,7 @@ fn dispatch_dlv(
     w_const: U256,
     curr_ms: i64,
     dlv_calls: &mut u64,
+    tick_count: u64,
 ) {
     if !vault.virtual_debt.is_zero() {
         let dlv_period_check = if let Some(p) = cfg.dlv.period {
@@ -1021,9 +1065,25 @@ fn dispatch_dlv(
                     vault.last_debt_rebalance_ms = curr_ms;
                 }
                 *dlv_calls += 1;
+                emit_parity_log("DLV", *dlv_calls, tick_count, vault, pool);
             }
         }
     }
+}
+
+fn emit_parity_log(kind: &str, n: u64, tick_count: u64, vault: &Vault, pool: &CorePool) {
+    if std::env::var("PARITY_CHECK").is_err() { return; }
+    let (t0, t1) = vault.total_amounts(pool);
+    let cr_wad = vault.collateral_ratio_wad(pool, None);
+    eprintln!(
+        "[PARITY] kind={} n={} tick={} total0={} total1={} idle0={} idle1={} vdebt={} pool_tick={} cr_wad={}",
+        kind, n, tick_count,
+        t0.to_dec_string(), t1.to_dec_string(),
+        vault.idle0.to_dec_string(), vault.idle1.to_dec_string(),
+        vault.virtual_debt.to_dec_string(),
+        pool.tick_current(),
+        cr_wad.to_dec_string(),
+    );
 }
 
 fn dispatch_alm(
@@ -1102,6 +1162,7 @@ fn dispatch_alm(
             eprintln!("[ALM-LOG] tick={} type=ratio dev_bps={} alm_count={} baseLiq={} limitLiq={}",
                 tick_count, dev_bps_val, *alm_calls, bl.to_dec_string(), ll.to_dec_string());
         }
+        emit_parity_log("ALM", *alm_calls, tick_count, vault, pool);
     } else if time_trigger {
         vault.last_rebalance_ms = curr_ms;
         *alm_calls += 1;
@@ -1111,6 +1172,7 @@ fn dispatch_alm(
             eprintln!("[ALM-LOG] tick={} type=time alm_count={} baseLiq={} limitLiq={}",
                 tick_count, *alm_calls, bl.to_dec_string(), ll.to_dec_string());
         }
+        emit_parity_log("ALM", *alm_calls, tick_count, vault, pool);
     }
 }
 

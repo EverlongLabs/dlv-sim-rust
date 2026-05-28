@@ -178,6 +178,16 @@ impl EventReader {
             }
         }
 
+        // Sort by (block_number, log_index) to match TS UNION_SQL ORDER BY block_number, log_index.
+        // The parquet file is primarily date-sorted, but ~35 rows at DST boundaries have block
+        // order inverted vs date order (date column was recorded in local time during DST flip,
+        // not UTC). TS's cursor iterates in (block, log) order; matching that here is required
+        // for the simulator to assign events to the same periods in both implementations.
+        events.sort_by(|a, b| {
+            a.block_number.cmp(&b.block_number)
+                .then(a.log_index.cmp(&b.log_index))
+        });
+
         events
     }
 }

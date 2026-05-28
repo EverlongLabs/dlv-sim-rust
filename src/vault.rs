@@ -793,7 +793,9 @@ impl Vault {
         if denominator.is_zero() { return "noop"; }
 
         static RD_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        static RD_PARITY_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let log_idx = RD_LOG_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        let parity_check = std::env::var("PARITY_CHECK").is_ok();
 
         // Case 1: CR > target AND V > S → mint stable debt
         if cr_wad > tc && v > s {
@@ -810,6 +812,13 @@ impl Vault {
                             amount.to_dec_string(), s.to_dec_string(), v.to_dec_string(),
                             cr_wad.to_dec_string(), self.idle0.to_dec_string(), self.idle1.to_dec_string(),
                             d.to_dec_string(), alm_correction.to_dec_string(), debt_correction.to_dec_string());
+                    }
+                    if parity_check {
+                        let n = RD_PARITY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        eprintln!("[RD-PARITY] n={} mode=mint amt={} total0={} total1={} v={} s={} gav={} cr_wad={} debt_before={}",
+                            n, amount.to_dec_string(), total0.to_dec_string(), total1.to_dec_string(),
+                            v.to_dec_string(), s.to_dec_string(), gav.to_dec_string(),
+                            cr_wad.to_dec_string(), d.to_dec_string());
                     }
                     self.virtual_debt = self.virtual_debt + amount;
                     if self.pool_config.is_volatile_token0() {
@@ -844,6 +853,13 @@ impl Vault {
                             cr_wad.to_dec_string(), self.idle0.to_dec_string(), self.idle1.to_dec_string(),
                             d.to_dec_string(), alm_correction.to_dec_string(), debt_correction.to_dec_string(),
                             stable_idle.to_dec_string());
+                    }
+                    if parity_check {
+                        let n = RD_PARITY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        eprintln!("[RD-PARITY] n={} mode=burn amt={} total0={} total1={} v={} s={} gav={} cr_wad={} debt_before={}",
+                            n, amount.to_dec_string(), total0.to_dec_string(), total1.to_dec_string(),
+                            v.to_dec_string(), s.to_dec_string(), gav.to_dec_string(),
+                            cr_wad.to_dec_string(), d.to_dec_string());
                     }
                     self.virtual_debt = self.virtual_debt - amount;
                     if self.pool_config.is_volatile_token0() {
