@@ -24,6 +24,19 @@ fn main() {
         cfg.lookup_period,
         cfg.is_arb_strategy,
     );
+    println!(
+        "[CONFIG] slow_recenter={{enabled:{} min_dev:{} interval_s:{}}} lev_amm={{enabled:{} fee:{}}} alm_swap_price_source={}",
+        cfg.slow_recenter.enabled,
+        cfg.slow_recenter.min_deviation,
+        cfg.slow_recenter.trigger_interval_seconds,
+        cfg.lev_amm.enabled,
+        cfg.lev_amm.swap_fee,
+        cfg.dlv.alm_swap_price_source,
+    );
+    if std::env::var("CONFIG_ONLY").is_ok() {
+        println!("[CONFIG_ONLY] exiting without running backtest");
+        return;
+    }
 
     let result = strategy::run_backtest(&cfg);
 
