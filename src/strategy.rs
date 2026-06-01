@@ -732,6 +732,16 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             dlv_pre_sqrt = pool.sqrt_price_x96();
             dispatch_dlv(cfg, &mut vault, &mut pool, target_cr_wad, w_const, curr_ms, &mut dlv_calls, tick_count);
             dlv_nav = vault.total_pool_value(&pool, None);
+            if dlv_calls > prev_dlv {
+                let row = build_log_row(
+                    &vault, &pool, "DLV", curr_ms, row_date.clone(),
+                    ext_price, U256::ZERO, 0.0, I256::ZERO,
+                    prev_log_totals, prev_log_nav,
+                );
+                prev_log_totals = Some((row.total0, row.total1));
+                prev_log_nav = Some(row.after_total_pool_value);
+                tick_rows.push(row);
+            }
             log_arb_parity("post_dlv", &vault, &pool, tick_count);
 
             // ALM
