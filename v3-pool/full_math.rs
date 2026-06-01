@@ -14,12 +14,13 @@ pub fn mul_div(a: U256, b: U256, denominator: U256) -> U256 {
 
 /// (a * b) / denominator, rounded up
 pub fn mul_div_rounding_up(a: U256, b: U256, denominator: U256) -> U256 {
-    let result = mul_div(a, b, denominator);
-    // Check if there's a remainder
+    assert!(!denominator.is_zero(), "mul_div: division by zero");
+    // Compute the 512-bit product once and reuse it for both the quotient and the
+    // remainder test (the old code called mul_div — recomputing full_mul — and also
+    // built an unused wrapping_mul product).
     let (lo, hi) = a.full_mul(b);
-    let _product_back = result.wrapping_mul(denominator);
-    // If lo > product_back (mod 2^256), there was a fraction
-    // More precisely: if (hi:lo) > result * denominator, round up
+    let result = if hi.is_zero() { lo / denominator } else { U256::div_512(lo, hi, denominator) };
+    // Round up when (hi:lo) > result * denominator, i.e. there was a fraction.
     let (check_lo, check_hi) = result.full_mul(denominator);
     if hi > check_hi || (hi == check_hi && lo > check_lo) {
         assert!(result < MAX_UINT256, "OVERFLOW");
@@ -44,8 +45,13 @@ pub fn sqrt(value: U256) -> U256 {
         let v = value.lo as u64;
         return U256::from_u128((v as f64).sqrt().floor() as u128);
     }
+    // Seed Newton's method with a power-of-two just above the true root instead of
+    // value/2. For a ~192-bit input (root ~96 bits) value/2 needed ~95 iterations,
+    // each a full 256-bit division; 2^(msb/2 + 1) is >= sqrt(value) and only a few
+    // bits off, so it converges in a handful of iterations. The loop and its
+    // termination are unchanged, so the floor(sqrt) result is identical.
+    let mut x = U256::ONE << (value.msb() / 2 + 1);
     let mut z = value;
-    let mut x = (value >> 1) + ONE;
     while x < z {
         z = x;
         let div = value / x;

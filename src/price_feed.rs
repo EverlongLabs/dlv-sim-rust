@@ -119,12 +119,17 @@ pub fn load_price_feed(
 
         for line in content.lines() {
             if line.is_empty() { continue; }
-            let cols: Vec<&str> = line.splitn(6, ',').collect();
-            if cols.len() < 5 { continue; }
 
-            let mut timestamp_ms: i64 = match cols[0].parse() {
-                Ok(v) => v,
-                Err(_) => continue,
+            // These are 1-second Binance klines: a 6-month window is ~16M lines.
+            // Parse the timestamp (column 0) first and apply the cheap range/interval
+            // filters *before* touching the close price. The lazy `split` iterator
+            // avoids the per-line `Vec<&str>` heap allocation the old code paid 16M
+            // times, and `nth(3)` only scans to the close column for kept rows.
+            let mut cols = line.split(',');
+
+            let mut timestamp_ms: i64 = match cols.next().and_then(|s| s.parse().ok()) {
+                Some(v) => v,
+                None => continue,
             };
 
             // Binance uses microsecond timestamps for some pairs since 2025
@@ -134,15 +139,17 @@ pub fn load_price_feed(
 
             if timestamp_ms < start_ms || timestamp_ms > end_ms { continue; }
 
-            let close: f64 = match cols[4].parse() {
-                Ok(v) if v > 0.0 => v,
+            if sampling_interval_ms > 0 {
+                if let Some(last) = entries.last() {
+                    if timestamp_ms - last.timestamp_ms < sampling_interval_ms { continue; }
+                }
+            }
+
+            // close is column index 4 → 3rd item after the timestamp we consumed.
+            let close: f64 = match cols.nth(3).and_then(|s| s.parse().ok()) {
+                Some(v) if v > 0.0 => v,
                 _ => continue,
             };
-
-            if sampling_interval_ms > 0 && !entries.is_empty() {
-                let dt = timestamp_ms - entries.last().unwrap().timestamp_ms;
-                if dt < sampling_interval_ms { continue; }
-            }
 
             entries.push(PriceEntry { timestamp_ms, price: close });
         }

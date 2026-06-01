@@ -54,6 +54,25 @@ impl U256 {
         }
     }
 
+    /// Count trailing zeros (256 for zero)
+    #[inline]
+    pub fn trailing_zeros(&self) -> u32 {
+        if self.lo != 0 {
+            self.lo.trailing_zeros()
+        } else if self.hi != 0 {
+            128 + self.hi.trailing_zeros()
+        } else {
+            256
+        }
+    }
+
+    /// True for a non-zero exact power of two (single bit set)
+    #[inline]
+    pub fn is_power_of_two(&self) -> bool {
+        let (m1, _) = self.overflowing_sub(U256::ONE);
+        !self.is_zero() && (self.lo & m1.lo) == 0 && (self.hi & m1.hi) == 0
+    }
+
     /// Most significant bit position (0-indexed), panics on zero
     pub fn msb(&self) -> u32 {
         assert!(!self.is_zero(), "ZERO");
@@ -175,6 +194,17 @@ impl U256 {
                 return U256::from_u128(num_lo.lo / divisor.lo);
             }
             return Self::div_256_by_256(num_lo, divisor);
+        }
+
+        // Division by a power of two (e.g. Q96, Q128) is a right shift of the
+        // 512-bit numerator; the low 256 bits of (num_hi:num_lo) >> k match what
+        // the limb long-division below would truncate to.
+        if divisor.is_power_of_two() {
+            let k = divisor.trailing_zeros();
+            if k == 0 {
+                return num_lo;
+            }
+            return (num_lo >> k) | (num_hi << (256 - k));
         }
 
         // Convert to 64-bit limb arrays for the division
@@ -382,19 +412,31 @@ impl U256 {
 
     /// Convert to decimal string
     pub fn to_dec_string(&self) -> String {
-        if self.is_zero() {
-            return "0".to_string();
+        // Fast path: values that fit in u128 (the common case for idle/fees/ticks)
+        // use native formatting with no big-int division at all.
+        if self.hi == 0 {
+            return self.lo.to_string();
         }
-        let mut digits = Vec::new();
+        // Peel off 19 decimal digits per division (10^19 fits in u64), instead of
+        // one digit per division. The old loop did two 256-bit divisions *per digit*
+        // (`%` is itself div+mul+sub, plus a separate `/`) — ~156 div_limbs calls for
+        // a 78-digit number; this does ~5.
+        const CHUNK: u128 = 10_000_000_000_000_000_000; // 10^19
+        let chunk = U256::from_u128(CHUNK);
         let mut val = *self;
-        let ten = U256::from_u128(10);
+        let mut parts: Vec<u64> = Vec::new(); // little-endian, each < 10^19
         while !val.is_zero() {
-            let rem = val % ten;
-            digits.push((rem.lo as u8) + b'0');
-            val = val / ten;
+            let q = val / chunk;
+            let r = val - q.wrapping_mul(chunk); // remainder < 10^19, fits in lo
+            parts.push(r.lo as u64);
+            val = q;
         }
-        digits.reverse();
-        String::from_utf8(digits).unwrap()
+        let mut it = parts.iter().rev();
+        let mut s = it.next().unwrap().to_string(); // top chunk: no leading zeros
+        for p in it {
+            s.push_str(&format!("{:019}", p)); // lower chunks zero-padded
+        }
+        s
     }
 
     /// Serialize as 32-byte little-endian
@@ -482,6 +524,11 @@ impl Div for U256 {
         assert!(!rhs.is_zero(), "division by zero");
         if self.hi == 0 && rhs.hi == 0 {
             return U256::from_u128(self.lo / rhs.lo);
+        }
+        // Division by a power of two (e.g. Q96, Q128) is just a right shift —
+        // far cheaper than the 64-bit-limb long division below.
+        if rhs.is_power_of_two() {
+            return self >> rhs.trailing_zeros();
         }
         U256::div_256_by_256(self, rhs)
     }
