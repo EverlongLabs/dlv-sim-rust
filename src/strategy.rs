@@ -921,20 +921,57 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             .map(|p| (p.tick_lower, p.tick_upper))
             .unwrap_or((0, 0));
 
+        let (total0, total1) = vault.total_amounts(&pool);
+        let per_range = vault.per_range_amounts(&pool, None);
+        let after_cr = if cr_pct.is_finite() {
+            (cr_pct * 100.0).round() as i64
+        } else {
+            0
+        };
+        let lev_amm_debt = if vault.lev_amm_notional > U256::ZERO {
+            vault.virtual_debt
+        } else {
+            U256::ZERO
+        };
+
         writer.write_row(&RebalanceLogRow {
             timestamp_ms: curr_ms,
             date: date_str,
             rebalance_type: "SNAPSHOT",
-            price_wad: snap_price_wad,
+            raw_pool_price: snap_price_wad,
+            non_volatile_asset_price: snap_price_wad,
             external_price: ext_price,
-            total_value_stable: value_stable,
-            collateral_ratio_wad: cr_wad,
-            lp_ratio_wad: lp_ratio,
-            virtual_debt: vault.virtual_debt,
+            prev_total_pool_value: U256::ZERO,
+            after_total_pool_value: nav,
+            prev_collateral_ratio: 0,
+            after_collateral_ratio: after_cr,
+            lp_ratio,
+            swap_fee_stable: U256::ZERO,
+            alm_swap_fee_stable: U256::ZERO,
+            accumulated_swap_fees0: vault.accumulated_fees0,
+            accumulated_swap_fees1: vault.accumulated_fees1,
+            debt: vault.virtual_debt,
             idle0: vault.idle0,
             idle1: vault.idle1,
-            accumulated_fees0: vault.accumulated_fees0,
-            accumulated_fees1: vault.accumulated_fees1,
+            total0,
+            total1,
+            wide_amount0: per_range[0].0,
+            wide_amount1: per_range[0].1,
+            base_amount0: per_range[1].0,
+            base_amount1: per_range[1].1,
+            limit_amount0: per_range[2].0,
+            limit_amount1: per_range[2].1,
+            lev_amm_collateral: vault.lev_amm_collateral,
+            lev_amm_notional: vault.lev_amm_notional,
+            lev_amm_debt,
+            lev_amm_fee_revenue: vault.lev_amm_fee_revenue,
+            volatile_hold_value_stable: U256::ZERO,
+            realized_il: I256::ZERO,
+            swap_fees_gained_this_period: U256::ZERO,
+            regulate_debt_amount: I256::ZERO,
+            current_pps: U256::ZERO,
+            fundamental_pps: U256::ZERO,
+            equilibrium_price_wad: U256::ZERO,
             arb_profit_stable: arb_profit,
             arb_deviation_bps: arb_dev_bps,
             wide0,

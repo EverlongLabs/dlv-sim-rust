@@ -1600,6 +1600,25 @@ impl Vault {
         (t0 + f0 + self.idle0, t1 + f1 + self.idle1)
     }
 
+    /// Per-range token amounts (wide, base, limit) at the given (or current)
+    /// price — positions only, no fees. Mirrors TS getPerRangeAmounts(false, …).
+    pub fn per_range_amounts(
+        &self,
+        pool: &CorePool,
+        override_sqrt: Option<U256>,
+    ) -> [(U256, U256); 3] {
+        let sqrt_price = override_sqrt.unwrap_or_else(|| pool.sqrt_price_x96());
+        let mut out = [(U256::ZERO, U256::ZERO); 3];
+        for (i, pos) in [&self.wide, &self.base, &self.limit].iter().enumerate() {
+            if let Some(p) = pos {
+                if !p.liquidity.is_zero() {
+                    out[i] = amounts_for_liquidity(sqrt_price, p.tick_lower, p.tick_upper, p.liquidity);
+                }
+            }
+        }
+        out
+    }
+
     pub fn lp_amounts_round_up(&self, pool: &CorePool) -> (U256, U256) {
         let sqrt_price = pool.sqrt_price_x96();
         let mut total0 = U256::ZERO;
