@@ -13,7 +13,7 @@ use crate::enums::EventType;
 use crate::event_reader::{self, EventReader, PoolEvent};
 use crate::output::{JsonlWriter, RebalanceLogRow};
 use crate::price_feed;
-use crate::vault::Vault;
+use crate::vault::{PpsCache, Vault};
 
 fn wad() -> U256 { U256::from_u128(1_000_000_000_000_000_000) }
 
@@ -138,11 +138,18 @@ fn build_log_row(
     regulate_debt_amount: I256,
     prev_totals: Option<(U256, U256)>,
     prev_nav: Option<U256>,
+    pps_cache: &mut PpsCache,
 ) -> RebalanceLogRow {
     let snap_sqrt = pool.sqrt_price_x96();
     let snap_price = Vault::pool_price(snap_sqrt);
-    let nav = vault.total_pool_value(pool, None);
-    let gav = vault.total_value_in_stable(pool, None);
+    // Compute fees + per-range position amounts ONCE; derive total_amounts (=
+    // per-range + fees + idle) and gav/nav/cr from them, instead of letting the
+    // helpers recompute all_fees/lp_amounts ~5× per row.
+    let (f0, f1) = vault.all_fees_pub(pool);
+    let pr = vault.per_range_amounts(pool, None);
+    let t0 = pr[0].0 + pr[1].0 + pr[2].0 + f0 + vault.idle0;
+    let t1 = pr[0].1 + pr[1].1 + pr[2].1 + f1 + vault.idle1;
+    let (gav, nav, cr_pct) = vault.valuation_from_totals(t0, t1, snap_price);
 
     // volatileHoldValueStable (hodlNowStable) = the PREVIOUS logged row's token
     // amounts valued at the current price; realizedIL = round((GAV − hodl)·1e4 /
@@ -178,12 +185,11 @@ fn build_log_row(
         }
         _ => (U256::ZERO, I256::ZERO),
     };
-    let cr_pct = vault.collateral_ratio_pct(pool, None);
     let after_cr = if cr_pct.is_finite() { (cr_pct * 100.0).round() as i64 } else { 0 };
-    let lp = vault.lp_ratio(pool, None);
-    let (t0, t1) = vault.total_amounts(pool);
-    let pr = vault.per_range_amounts(pool, None);
-    let (cpps, fpps, eqp) = vault.compute_fundamental_pps(pool, nav, None);
+    // lpRatio uses round-up totals; reuse the fees/idle already computed.
+    let (ru0, ru1) = vault.lp_amounts_round_up(pool);
+    let lp = vault.lp_ratio_from(ru0 + f0 + vault.idle0, ru1 + f1 + vault.idle1, snap_price);
+    let (cpps, fpps, eqp) = vault.compute_fundamental_pps(pool, nav, None, pps_cache);
     let lad = if vault.lev_amm_notional > U256::ZERO { vault.virtual_debt } else { U256::ZERO };
     let (w0, w1) = vault.wide.as_ref().map(|p| (p.tick_lower, p.tick_upper)).unwrap_or((0, 0));
     let (b0, b1) = vault.base.as_ref().map(|p| (p.tick_lower, p.tick_upper)).unwrap_or((0, 0));
@@ -492,6 +498,8 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
     // (volatileHoldValueStable, realizedIL), updated after each emitted row.
     let mut prev_log_totals: Option<(U256, U256)> = None;
     let mut prev_log_nav: Option<U256> = None;
+    // Reuses the equilibrium search across rows with unchanged composition.
+    let mut pps_cache = PpsCache::default();
 
     // Log-return circular buffer for dynamic thresholds (match TS LogReturnsWindow)
     let vol_window_size = ((cfg.volatility_window_minutes as usize) * 60)
@@ -678,7 +686,7 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
                     let row = build_log_row(
                         &vault, &pool, "ARBITRAGE", curr_ms, row_date.clone(),
                         ext_price, arb_profit, arb_dev_bps, I256::ZERO,
-                        prev_log_totals, prev_log_nav,
+                        prev_log_totals, prev_log_nav, &mut pps_cache,
                     );
                     prev_log_totals = Some((row.total0, row.total1));
                     prev_log_nav = Some(row.after_total_pool_value);
@@ -706,7 +714,7 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
                     let row = build_log_row(
                         &vault, &pool, "LEV_AMM", curr_ms, row_date.clone(),
                         ext_price, U256::ZERO, 0.0, I256::ZERO,
-                        prev_log_totals, prev_log_nav,
+                        prev_log_totals, prev_log_nav, &mut pps_cache,
                     );
                     prev_log_totals = Some((row.total0, row.total1));
                     prev_log_nav = Some(row.after_total_pool_value);
@@ -736,8 +744,8 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
                 let row = build_log_row(
                     &vault, &pool, "DLV", curr_ms, row_date.clone(),
                     ext_price, U256::ZERO, 0.0, I256::ZERO,
-                    prev_log_totals, prev_log_nav,
-                );
+                    prev_log_totals, prev_log_nav, &mut pps_cache,
+                    );
                 prev_log_totals = Some((row.total0, row.total1));
                 prev_log_nav = Some(row.after_total_pool_value);
                 tick_rows.push(row);
@@ -1061,8 +1069,8 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             let row = build_log_row(
                 &vault, &pool, "SNAPSHOT", curr_ms, row_date.clone(),
                 ext_price, U256::ZERO, 0.0, I256::ZERO,
-                prev_log_totals, prev_log_nav,
-            );
+                prev_log_totals, prev_log_nav, &mut pps_cache,
+                    );
             prev_log_totals = Some((row.total0, row.total1));
             prev_log_nav = Some(row.after_total_pool_value);
             tick_rows.push(row);

@@ -8,6 +8,17 @@ use crate::config::{VaultParams, LevAmmConfig};
 use crate::pool_config::PoolConfig;
 
 const MANAGER: &str = "0xVAULT_MANAGER";
+
+/// Cache for the price-independent part of `compute_fundamental_pps` (the
+/// equilibrium binary search). fundamentalPPS/equilibriumPriceWad depend only on
+/// the vault composition, so they're reused across rows where it is unchanged.
+#[derive(Default)]
+pub struct PpsCache {
+    valid: bool,
+    key: u64,
+    fundamental_pps: U256,
+    equilibrium_price_wad: U256,
+}
 static RBD_DIAG_GLOBAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[derive(Debug)]
@@ -1676,6 +1687,28 @@ impl Vault {
         }
     }
 
+    /// Derive (GAV, NAV, CR%) from precomputed round-down totals + price, in a
+    /// single pass — avoids the ~5× total_amounts/all_fees recompute that calling
+    /// total_value_in_stable / total_pool_value / collateral_ratio_pct
+    /// separately would incur. Values are identical to those helpers.
+    pub fn valuation_from_totals(&self, t0: U256, t1: U256, price_wad: U256) -> (U256, U256, f64) {
+        let w = wad();
+        let gav = if self.pool_config.is_volatile_token0() {
+            t1 + full_math::mul_div(t0, price_wad, w)
+        } else if price_wad.is_zero() {
+            t0
+        } else {
+            t0 + full_math::mul_div(t1, w, price_wad)
+        };
+        let nav = if gav > self.virtual_debt { gav - self.virtual_debt } else { U256::ZERO };
+        let cr_pct = if self.virtual_debt.is_zero() {
+            f64::INFINITY
+        } else {
+            full_math::mul_div(gav, w, self.virtual_debt).lo as f64 / 1e18 * 100.0
+        };
+        (gav, nav, cr_pct)
+    }
+
     /// NAV = GAV - virtualDebt (matches TS totalPoolValue)
     pub fn total_pool_value(&self, pool: &CorePool, override_sqrt: Option<U256>) -> U256 {
         let gav = self.total_value_in_stable(pool, override_sqrt);
@@ -1710,6 +1743,26 @@ impl Vault {
         full_math::mul_div(stable_amt, w, volatile_value_stable)
     }
 
+    /// lpRatio from precomputed round-up totals + price (identical to lp_ratio).
+    pub fn lp_ratio_from(&self, total0: U256, total1: U256, price_wad: U256) -> U256 {
+        let w = wad();
+        let (volatile_amt, stable_amt) = if self.pool_config.is_volatile_token0() {
+            (total0, total1)
+        } else {
+            (total1, total0)
+        };
+        let volatile_value_stable = if self.pool_config.is_volatile_token0() {
+            full_math::mul_div(volatile_amt, price_wad, w)
+        } else {
+            if price_wad.is_zero() { return U256::from_u128(u128::MAX / 2); }
+            full_math::mul_div(volatile_amt, w, price_wad)
+        };
+        if volatile_value_stable.is_zero() {
+            return U256::from_u128(u128::MAX / 2);
+        }
+        full_math::mul_div(stable_amt, w, volatile_value_stable)
+    }
+
     /// CR in WAD = GAV * WAD / virtualDebt (matches TS collateralRatioWad)
     pub fn collateral_ratio_wad(&self, pool: &CorePool, override_sqrt: Option<U256>) -> U256 {
         if self.virtual_debt.is_zero() {
@@ -1727,6 +1780,7 @@ impl Vault {
         pool: &CorePool,
         current_nav: U256,
         override_sqrt: Option<U256>,
+        cache: &mut PpsCache,
     ) -> (U256, U256, U256) {
         let w = wad();
         let ts = self.total_supply;
@@ -1761,6 +1815,37 @@ impl Vault {
         }
         if !has_active {
             return (current_pps, current_pps, current_price_wad);
+        }
+
+        // The equilibrium search is price-independent — it depends only on the
+        // vault composition (positions + tokensOwed, idle, debt, totalSupply).
+        // Fingerprint that and reuse the cached result across rows where it is
+        // unchanged; only currentPPS (above) is recomputed per row.
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for &(lo, hi, liq, f0, f1) in &positions {
+                lo.hash(&mut h);
+                hi.hash(&mut h);
+                liq.lo.hash(&mut h);
+                liq.hi.hash(&mut h);
+                f0.lo.hash(&mut h);
+                f0.hi.hash(&mut h);
+                f1.lo.hash(&mut h);
+                f1.hi.hash(&mut h);
+            }
+            self.idle0.lo.hash(&mut h);
+            self.idle0.hi.hash(&mut h);
+            self.idle1.lo.hash(&mut h);
+            self.idle1.hi.hash(&mut h);
+            self.virtual_debt.lo.hash(&mut h);
+            self.virtual_debt.hi.hash(&mut h);
+            ts.lo.hash(&mut h);
+            ts.hi.hash(&mut h);
+            h.finish()
+        };
+        if cache.valid && cache.key == key {
+            return (current_pps, cache.fundamental_pps, cache.equilibrium_price_wad);
         }
 
         let idle0 = self.idle0;
@@ -1846,6 +1931,10 @@ impl Vault {
         let eq_nav = if eq_gav > self.virtual_debt { eq_gav - self.virtual_debt } else { U256::ZERO };
         let fundamental_pps = full_math::mul_div(eq_nav, w, ts);
 
+        cache.valid = true;
+        cache.key = key;
+        cache.fundamental_pps = fundamental_pps;
+        cache.equilibrium_price_wad = eq_price_wad;
         (current_pps, fundamental_pps, eq_price_wad)
     }
 
