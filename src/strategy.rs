@@ -122,6 +122,121 @@ fn replay_event(pool: &mut CorePool, event: &PoolEvent) {
     }
 }
 
+/// Build a full dashboard row from the current vault/pool state, mirroring TS's
+/// persistVaultLogEntry. Used at each event dispatch point (ARBITRAGE / LEV_AMM /
+/// SNAPSHOT) so the Rust row stream matches TS's event-driven log.
+#[allow(clippy::too_many_arguments)]
+fn build_log_row(
+    vault: &Vault,
+    pool: &CorePool,
+    label: &'static str,
+    timestamp_ms: i64,
+    date: String,
+    ext_price: f64,
+    arb_profit: U256,
+    arb_dev_bps: f64,
+    regulate_debt_amount: I256,
+    prev_totals: Option<(U256, U256)>,
+    prev_nav: Option<U256>,
+) -> RebalanceLogRow {
+    let snap_sqrt = pool.sqrt_price_x96();
+    let snap_price = Vault::pool_price(snap_sqrt);
+    let nav = vault.total_pool_value(pool, None);
+    let gav = vault.total_value_in_stable(pool, None);
+
+    // volatileHoldValueStable (hodlNowStable) = the PREVIOUS logged row's token
+    // amounts valued at the current price; realizedIL = round((GAV − hodl)·1e4 /
+    // prevNAV). Ports TS persistVaultLogEntry's IL block (swap-fee delta is 0 in
+    // this window). The first row has no predecessor → both 0, matching TS.
+    let is_vol_t0 = vault.pool_config.is_volatile_token0();
+    let w = U256::from_u128(1_000_000_000_000_000_000);
+    let (volatile_hold_value_stable, realized_il) = match (prev_totals, prev_nav) {
+        (Some((p0, p1)), Some(pnav)) if !pnav.is_zero() => {
+            let (pvol, pstab) = if is_vol_t0 { (p0, p1) } else { (p1, p0) };
+            let vol_val = if is_vol_t0 {
+                full_math::mul_div(pvol, snap_price, w)
+            } else if snap_price.is_zero() {
+                U256::ZERO
+            } else {
+                full_math::mul_div(pvol, w, snap_price)
+            };
+            let hodl = pstab + vol_val;
+            let num = gav.lo as i128 - hodl.lo as i128;
+            let denom = pnav.lo as i128;
+            let scaled = num * 10000;
+            let il = if scaled >= 0 {
+                (scaled + denom / 2) / denom
+            } else {
+                (scaled - denom / 2) / denom
+            };
+            let il_i256 = if il < 0 {
+                I256(U256::from_u128((-il) as u128)).negate()
+            } else {
+                I256(U256::from_u128(il as u128))
+            };
+            (hodl, il_i256)
+        }
+        _ => (U256::ZERO, I256::ZERO),
+    };
+    let cr_pct = vault.collateral_ratio_pct(pool, None);
+    let after_cr = if cr_pct.is_finite() { (cr_pct * 100.0).round() as i64 } else { 0 };
+    let lp = vault.lp_ratio(pool, None);
+    let (t0, t1) = vault.total_amounts(pool);
+    let pr = vault.per_range_amounts(pool, None);
+    let (cpps, fpps, eqp) = vault.compute_fundamental_pps(pool, nav, None);
+    let lad = if vault.lev_amm_notional > U256::ZERO { vault.virtual_debt } else { U256::ZERO };
+    let (w0, w1) = vault.wide.as_ref().map(|p| (p.tick_lower, p.tick_upper)).unwrap_or((0, 0));
+    let (b0, b1) = vault.base.as_ref().map(|p| (p.tick_lower, p.tick_upper)).unwrap_or((0, 0));
+    let (l0, l1) = vault.limit.as_ref().map(|p| (p.tick_lower, p.tick_upper)).unwrap_or((0, 0));
+    RebalanceLogRow {
+        timestamp_ms,
+        date,
+        rebalance_type: label,
+        raw_pool_price: snap_price,
+        non_volatile_asset_price: snap_price,
+        external_price: ext_price,
+        prev_total_pool_value: nav,
+        after_total_pool_value: nav,
+        prev_collateral_ratio: after_cr,
+        after_collateral_ratio: after_cr,
+        lp_ratio: lp,
+        swap_fee_stable: U256::ZERO,
+        alm_swap_fee_stable: U256::ZERO,
+        accumulated_swap_fees0: vault.accumulated_fees0,
+        accumulated_swap_fees1: vault.accumulated_fees1,
+        debt: vault.virtual_debt,
+        idle0: vault.idle0,
+        idle1: vault.idle1,
+        total0: t0,
+        total1: t1,
+        wide_amount0: pr[0].0,
+        wide_amount1: pr[0].1,
+        base_amount0: pr[1].0,
+        base_amount1: pr[1].1,
+        limit_amount0: pr[2].0,
+        limit_amount1: pr[2].1,
+        lev_amm_collateral: vault.lev_amm_collateral,
+        lev_amm_notional: vault.lev_amm_notional,
+        lev_amm_debt: lad,
+        lev_amm_fee_revenue: vault.lev_amm_fee_revenue,
+        volatile_hold_value_stable,
+        realized_il,
+        swap_fees_gained_this_period: U256::ZERO,
+        regulate_debt_amount,
+        current_pps: cpps,
+        fundamental_pps: fpps,
+        equilibrium_price_wad: eqp,
+        arb_profit_stable: arb_profit,
+        arb_deviation_bps: arb_dev_bps,
+        wide0: w0,
+        wide1: w1,
+        base0: b0,
+        base1: b1,
+        limit0: l0,
+        limit1: l1,
+    }
+}
+
 pub fn run_backtest(cfg: &Config) -> BacktestResult {
     let mut event_reader = EventReader::new(&cfg.pool_config.db_path);
     if !event_reader.exists() {
@@ -373,6 +488,11 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
     let idle_snapshot_interval_ms: i64 = 3600 * 1000;
     let mut last_idle_snapshot_ms: i64 = 0;
 
+    // Previous LOGGED row's totals / NAV — drives the prev-relative fields
+    // (volatileHoldValueStable, realizedIL), updated after each emitted row.
+    let mut prev_log_totals: Option<(U256, U256)> = None;
+    let mut prev_log_nav: Option<U256> = None;
+
     // Log-return circular buffer for dynamic thresholds (match TS LogReturnsWindow)
     let vol_window_size = ((cfg.volatility_window_minutes as usize) * 60)
         .checked_div(cfg.lookup_period as usize)
@@ -444,6 +564,11 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
 
         let mut arb_profit = U256::ZERO;
         let mut arb_dev_bps = 0.0f64;
+
+        // Event-driven dashboard rows captured this tick, in dispatch order
+        // (ARBITRAGE → LEV_AMM → … → SNAPSHOT), emitted together at end of tick.
+        let row_date = event_reader::fmt_utc_date(curr_ms);
+        let mut tick_rows: Vec<RebalanceLogRow> = Vec::new();
 
         let prev_alm = alm_calls;
         let prev_dlv = dlv_calls;
@@ -550,6 +675,14 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
                     arb_fired = true;
                     arb_nav = vault.total_pool_value(&pool, None);
                     arb_debt = vault.virtual_debt;
+                    let row = build_log_row(
+                        &vault, &pool, "ARBITRAGE", curr_ms, row_date.clone(),
+                        ext_price, arb_profit, arb_dev_bps, I256::ZERO,
+                        prev_log_totals, prev_log_nav,
+                    );
+                    prev_log_totals = Some((row.total0, row.total1));
+                    prev_log_nav = Some(row.after_total_pool_value);
+                    tick_rows.push(row);
                 }
             }
             log_arb_parity("post_arb", &vault, &pool, tick_count);
@@ -570,6 +703,14 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
                     lev_amm_fired = true;
                     lev_amm_nav = vault.total_pool_value(&pool, None);
                     lev_amm_debt = vault.virtual_debt;
+                    let row = build_log_row(
+                        &vault, &pool, "LEV_AMM", curr_ms, row_date.clone(),
+                        ext_price, U256::ZERO, 0.0, I256::ZERO,
+                        prev_log_totals, prev_log_nav,
+                    );
+                    prev_log_totals = Some((row.total0, row.total1));
+                    prev_log_nav = Some(row.after_total_pool_value);
+                    tick_rows.push(row);
                 }
             }
             log_arb_parity("post_lev_amm", &vault, &pool, tick_count);
@@ -897,92 +1038,29 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             }
         }
 
-        let date_str = event_reader::fmt_utc_date(curr_ms);
-
         // Hourly progress
         let secs_in_day = (curr_ms / 1000) % 86400;
         if secs_in_day % 3600 == 0 {
-            println!("[BACKTEST] {}", date_str);
+            println!("[BACKTEST] {}", row_date);
         }
 
-        let (base0, base1) = vault
-            .base
-            .as_ref()
-            .map(|p| (p.tick_lower, p.tick_upper))
-            .unwrap_or((0, 0));
-        let (wide0, wide1) = vault
-            .wide
-            .as_ref()
-            .map(|p| (p.tick_lower, p.tick_upper))
-            .unwrap_or((0, 0));
-        let (lim0, lim1) = vault
-            .limit
-            .as_ref()
-            .map(|p| (p.tick_lower, p.tick_upper))
-            .unwrap_or((0, 0));
+        // Hourly idle SNAPSHOT — captured from end-of-period state (matches TS's
+        // post-ALM SNAPSHOT dispatch), pushed after any ARBITRAGE/LEV_AMM rows so
+        // same-timestamp ordering matches TS's dispatch order.
+        if idle_snapshot_due {
+            let row = build_log_row(
+                &vault, &pool, "SNAPSHOT", curr_ms, row_date.clone(),
+                ext_price, U256::ZERO, 0.0, I256::ZERO,
+                prev_log_totals, prev_log_nav,
+            );
+            prev_log_totals = Some((row.total0, row.total1));
+            prev_log_nav = Some(row.after_total_pool_value);
+            tick_rows.push(row);
+        }
 
-        let (total0, total1) = vault.total_amounts(&pool);
-        let per_range = vault.per_range_amounts(&pool, None);
-        let after_cr = if cr_pct.is_finite() {
-            (cr_pct * 100.0).round() as i64
-        } else {
-            0
-        };
-        let lev_amm_debt = if vault.lev_amm_notional > U256::ZERO {
-            vault.virtual_debt
-        } else {
-            U256::ZERO
-        };
-        let (current_pps, fundamental_pps, equilibrium_price_wad) =
-            vault.compute_fundamental_pps(&pool, nav, None);
-
-        writer.write_row(&RebalanceLogRow {
-            timestamp_ms: curr_ms,
-            date: date_str,
-            rebalance_type: "SNAPSHOT",
-            raw_pool_price: snap_price_wad,
-            non_volatile_asset_price: snap_price_wad,
-            external_price: ext_price,
-            prev_total_pool_value: nav,
-            after_total_pool_value: nav,
-            prev_collateral_ratio: after_cr,
-            after_collateral_ratio: after_cr,
-            lp_ratio,
-            swap_fee_stable: U256::ZERO,
-            alm_swap_fee_stable: U256::ZERO,
-            accumulated_swap_fees0: vault.accumulated_fees0,
-            accumulated_swap_fees1: vault.accumulated_fees1,
-            debt: vault.virtual_debt,
-            idle0: vault.idle0,
-            idle1: vault.idle1,
-            total0,
-            total1,
-            wide_amount0: per_range[0].0,
-            wide_amount1: per_range[0].1,
-            base_amount0: per_range[1].0,
-            base_amount1: per_range[1].1,
-            limit_amount0: per_range[2].0,
-            limit_amount1: per_range[2].1,
-            lev_amm_collateral: vault.lev_amm_collateral,
-            lev_amm_notional: vault.lev_amm_notional,
-            lev_amm_debt,
-            lev_amm_fee_revenue: vault.lev_amm_fee_revenue,
-            volatile_hold_value_stable: value_stable,
-            realized_il: I256::ZERO,
-            swap_fees_gained_this_period: U256::ZERO,
-            regulate_debt_amount: I256::ZERO,
-            current_pps,
-            fundamental_pps,
-            equilibrium_price_wad,
-            arb_profit_stable: arb_profit,
-            arb_deviation_bps: arb_dev_bps,
-            wide0,
-            wide1,
-            base0,
-            base1,
-            limit0: lim0,
-            limit1: lim1,
-        });
+        for row in &tick_rows {
+            writer.write_row(row);
+        }
 
         curr_ms += step_ms;
     }
