@@ -933,6 +933,8 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
         } else {
             U256::ZERO
         };
+        let (current_pps, fundamental_pps, equilibrium_price_wad) =
+            vault.compute_fundamental_pps(&pool, nav, None);
 
         writer.write_row(&RebalanceLogRow {
             timestamp_ms: curr_ms,
@@ -969,9 +971,9 @@ pub fn run_backtest(cfg: &Config) -> BacktestResult {
             realized_il: I256::ZERO,
             swap_fees_gained_this_period: U256::ZERO,
             regulate_debt_amount: I256::ZERO,
-            current_pps: U256::ZERO,
-            fundamental_pps: U256::ZERO,
-            equilibrium_price_wad: U256::ZERO,
+            current_pps,
+            fundamental_pps,
+            equilibrium_price_wad,
             arb_profit_stable: arb_profit,
             arb_deviation_bps: arb_dev_bps,
             wide0,

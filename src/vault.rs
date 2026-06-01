@@ -1719,6 +1719,136 @@ impl Vault {
         full_math::mul_div(value, wad(), self.virtual_debt)
     }
 
+    /// currentPPS, fundamentalPPS, equilibriumPriceWad — ports TS
+    /// computeFundamentalPPSFrom / _computeFundamentalPPSCore (managerFee = 0).
+    /// `current_nav` is the precomputed NAV (GAV − virtualDebt).
+    pub fn compute_fundamental_pps(
+        &self,
+        pool: &CorePool,
+        current_nav: U256,
+        override_sqrt: Option<U256>,
+    ) -> (U256, U256, U256) {
+        let w = wad();
+        let ts = self.total_supply;
+        if ts.is_zero() {
+            return (U256::ZERO, U256::ZERO, U256::ZERO);
+        }
+        let current_price_wad = Self::pool_price(override_sqrt.unwrap_or_else(|| pool.sqrt_price_x96()));
+        let current_pps = full_math::mul_div(current_nav, w, ts);
+
+        let is_vol_t0 = self.pool_config.is_volatile_token0();
+        let vol_to_stable = |amt: U256, price: U256| -> U256 {
+            if is_vol_t0 {
+                full_math::mul_div(amt, price, w)
+            } else if price.is_zero() {
+                U256::ZERO
+            } else {
+                full_math::mul_div(amt, w, price)
+            }
+        };
+
+        // Gather position data (liquidity + fees owed, managerFee = 0 → fees = tokensOwed).
+        let mut positions: Vec<(i32, i32, U256, U256, U256)> = Vec::with_capacity(3);
+        let mut has_active = false;
+        for pos in [&self.wide, &self.base, &self.limit] {
+            if let Some(p) = pos {
+                let pp = pool.position_manager().get_position_readonly(MANAGER, p.tick_lower, p.tick_upper);
+                if !pp.liquidity.is_zero() {
+                    has_active = true;
+                }
+                positions.push((p.tick_lower, p.tick_upper, pp.liquidity, pp.tokens_owed_0, pp.tokens_owed_1));
+            }
+        }
+        if !has_active {
+            return (current_pps, current_pps, current_price_wad);
+        }
+
+        let idle0 = self.idle0;
+        let idle1 = self.idle1;
+        let compute_totals_at = |sqrt: U256| -> (U256, U256) {
+            let mut t0 = idle0;
+            let mut t1 = idle1;
+            for &(lo, hi, liq, f0, f1) in &positions {
+                if liq.is_zero() && f0.is_zero() && f1.is_zero() {
+                    continue;
+                }
+                let (a0, a1) = amounts_for_liquidity(sqrt, lo, hi, liq);
+                t0 = t0 + a0 + f0;
+                t1 = t1 + a1 + f1;
+            }
+            (t0, t1)
+        };
+        let volatile_share = |sqrt: U256| -> U256 {
+            let (t0, t1) = compute_totals_at(sqrt);
+            let price = Self::pool_price(sqrt);
+            let (vol_amt, stable_amt) = if is_vol_t0 { (t0, t1) } else { (t1, t0) };
+            let vol_val = vol_to_stable(vol_amt, price);
+            let total_val = stable_amt + vol_val;
+            if total_val.is_zero() {
+                return U256::ZERO;
+            }
+            full_math::mul_div(vol_val, w, total_val)
+        };
+
+        let min_pos_lower = positions.iter().map(|p| p.0).min().unwrap();
+        let max_pos_upper = positions.iter().map(|p| p.1).max().unwrap();
+        let min_tick = std::cmp::max(-MAX_TICK, min_pos_lower - 5000);
+        let max_tick = std::cmp::min(MAX_TICK, max_pos_upper + 5000);
+        let share_increases_with_tick = !is_vol_t0;
+
+        let target = w / U256::from_u128(2);
+        let tolerance = w / U256::from_u128(1000);
+
+        let bisect = |lo: i32, hi: i32, init_sqrt: U256, init_diff: U256| -> (U256, U256) {
+            let mut b_sqrt = init_sqrt;
+            let mut b_diff = init_diff;
+            let mut t_low = lo;
+            let mut t_high = hi;
+            for _ in 0..30 {
+                let mid_tick = (t_low + t_high) / 2; // floor (TS Math.floor on int avg)
+                if mid_tick <= t_low || mid_tick >= t_high {
+                    break;
+                }
+                let mid = tick_math::get_sqrt_ratio_at_tick(mid_tick);
+                let ratio = volatile_share(mid);
+                let diff = if ratio > target { ratio - target } else { target - ratio };
+                if diff < b_diff {
+                    b_diff = diff;
+                    b_sqrt = mid;
+                }
+                if diff < tolerance {
+                    break;
+                }
+                let needs_higher = if share_increases_with_tick { ratio < target } else { ratio > target };
+                if needs_higher {
+                    t_low = mid_tick;
+                } else {
+                    t_high = mid_tick;
+                }
+            }
+            (b_sqrt, b_diff)
+        };
+
+        let current_sqrt = pool.sqrt_price_x96();
+        let current_tick = tick_math::get_tick_at_sqrt_ratio(current_sqrt);
+        let current_ratio = volatile_share(current_sqrt);
+        let current_diff = if current_ratio > target { current_ratio - target } else { target - current_ratio };
+
+        let (lo_sqrt, lo_diff) = bisect(min_tick, current_tick, current_sqrt, current_diff);
+        let (hi_sqrt, hi_diff) = bisect(current_tick, max_tick, current_sqrt, current_diff);
+        let best_sqrt = if lo_diff <= hi_diff { lo_sqrt } else { hi_sqrt };
+
+        let eq_price_wad = Self::pool_price(best_sqrt);
+        let (eq_t0, eq_t1) = compute_totals_at(best_sqrt);
+        let (eq_vol, eq_stable) = if is_vol_t0 { (eq_t0, eq_t1) } else { (eq_t1, eq_t0) };
+        let eq_vol_in_stable = vol_to_stable(eq_vol, eq_price_wad);
+        let eq_gav = eq_stable + eq_vol_in_stable;
+        let eq_nav = if eq_gav > self.virtual_debt { eq_gav - self.virtual_debt } else { U256::ZERO };
+        let fundamental_pps = full_math::mul_div(eq_nav, w, ts);
+
+        (current_pps, fundamental_pps, eq_price_wad)
+    }
+
     /// |stableShareBps - 5000| (matches TS shareDeviationBpsFromValues)
     /// Uses roundUp totals to match TS shouldForceActiveRebalance(getTotalAmounts(true))
     pub fn share_deviation_bps(&self, pool: &CorePool, override_sqrt: Option<U256>) -> u64 {
